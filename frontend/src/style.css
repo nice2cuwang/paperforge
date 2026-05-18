@@ -1,0 +1,57 @@
+:root {
+  --bg: #f7f7f2;
+  --surface: #fffef9;
+  --surface-strong: #ffffff;
+  --ink: #111423;
+  --muted: #56607c;
+  --line: #d9dfeb;
+  --accent: #0f7f78;
+  --accent-strong: #0b5e59;
+  --signal: #b97117;
+  --danger: #b42318;
+  color: var(--ink);
+  font: 400 15px/1.6 "IBM Plex Sans", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(1200px 700px at -10% -30%, #d9f1ea 0%, transparent 50%),
+    radial-gradient(900px 560px at 110% 0%, #f7e8cc 0%, transparent 50%),
+    linear-gradient(180deg, #f6f7f3 0%, #f3f6f9 35%, #f7f7f2 100%);
+  color: var(--ink);
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image: linear-gradient(rgba(21, 31, 44, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(21, 31, 44, 0.02) 1px, transparent 1px);
+  background-size: 24px 24px;
+  mask-image: radial-gradient(circle at 50% 30%, #000 0%, transparent 75%);
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
