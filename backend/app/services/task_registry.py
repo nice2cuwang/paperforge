@@ -10,7 +10,27 @@ from threading import RLock as Lock
 from typing import Any
 from uuid import uuid4
 
+from fastapi import HTTPException
+
 logger = logging.getLogger(__name__)
+
+
+def _workflow_error_detail(exc: Exception) -> tuple[str, dict[str, Any]]:
+    if isinstance(exc, HTTPException):
+        if isinstance(exc.detail, dict):
+            detail = dict(exc.detail)
+            reason = str(detail.get("message") or detail.get("title") or detail.get("code") or "request failed")
+            detail.setdefault("http_status", exc.status_code)
+            return reason, detail
+        message = str(exc.detail)
+        return message, {"code": "HTTP_ERROR", "message": message, "http_status": exc.status_code}
+    message = str(exc)
+    return message, {"code": "UNEXPECTED_ERROR", "message": message}
+
+
+def _fail_task_for_exception(task_id: str, exc: Exception) -> None:
+    reason, detail = _workflow_error_detail(exc)
+    fail_task(task_id, reason, detail)
 
 # Default TTL: 24 hours for completed/failed tasks, 2 hours for running tasks.
 _TASK_COMPLETED_TTL_SECONDS = int(60 * 60 * 24)
@@ -62,12 +82,23 @@ def _load() -> dict[str, TaskRecord]:
         with open(_PERSIST_PATH, "r", encoding="utf-8") as fh:
             payload = json.load(fh)
         records = {}
+        orphaned = 0
         for tid, data in payload.items():
             try:
-                records[tid] = _dict_to_record(data)
+                rec = _dict_to_record(data)
+                if rec.status == "running":
+                    rec.status = "failed"
+                    rec.current_step = "failed"
+                    rec.logs.append("failed: 服务端重启，任务中断（无恢复机制）")
+                    _touch(rec)
+                    orphaned += 1
+                records[tid] = rec
             except Exception:
                 logger.warning("skipped corrupted task record: %s", tid)
                 continue
+        if orphaned:
+            logger.warning("marked %d orphaned running task(s) as failed", orphaned)
+            _save_from_records(records)
         logger.info("loaded %d task(s) from %s", len(records), _PERSIST_PATH)
         return records
     except Exception as exc:
@@ -75,15 +106,19 @@ def _load() -> dict[str, TaskRecord]:
         return {}
 
 
-def _save() -> None:
+def _save_from_records(records: dict[str, TaskRecord]) -> None:
     try:
-        payload = {tid: _record_to_dict(t) for tid, t in _task_store.items()}
+        payload = {tid: _record_to_dict(t) for tid, t in records.items()}
         tmp = _PERSIST_PATH.with_suffix(".json.tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
         os.replace(tmp, _PERSIST_PATH)
     except Exception as exc:
         logger.warning("failed to persist tasks: %s", exc)
+
+
+def _save() -> None:
+    _save_from_records(_task_store)
 
 
 @dataclass

@@ -2,12 +2,15 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Draft, Project, ReviewIssue
-from app.schemas import ReviewIssueCreate, ReviewIssueRead, ReviewIssueUpdate
+from app.models import Draft, EvidenceCard, Project, ReviewIssue
+from app.schemas import ReviewDraftRequest, ReviewIssueCreate, ReviewIssueRead, ReviewIssueUpdate, ReviseDraftRequest
+from app.services.review_service import review_draft_with_metrics, revise_draft, score_quality
+from app.services.task_registry import complete_task, create_task, _fail_task_for_exception
+from app.services.workflow.helpers import _evidence_to_dict, _next_draft_version, _now
 
 router = APIRouter(prefix="/api", tags=["review-issues"])
 
@@ -102,3 +105,135 @@ def delete_review_issue(issue_id: str, db: Session = Depends(get_db)) -> Respons
     db.delete(issue)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/projects/{project_id}/review-draft")
+def run_review(
+    project_id: str, payload: ReviewDraftRequest, db: Session = Depends(get_db)
+) -> dict:
+    project = _get_project_or_404(project_id, db)
+    draft = _get_draft_for_project_or_404(project_id, payload.draft_id, db)
+    task = create_task("review-draft")
+    try:
+        cards = list(db.scalars(select(EvidenceCard).where(EvidenceCard.project_id == project_id)).all())
+        issue_payloads, review_metrics = review_draft_with_metrics(
+            draft.content_md,
+            evidence_cards=[_evidence_to_dict(item) for item in cards],
+            article_type=project.article_type,
+        )
+        db.execute(delete(ReviewIssue).where(ReviewIssue.draft_id == draft.id))
+
+        created_issues: list[ReviewIssue] = []
+        for payload_item in issue_payloads:
+            issue = ReviewIssue(
+                id=str(uuid4()),
+                project_id=project_id,
+                draft_id=draft.id,
+                severity=payload_item["severity"],
+                issue_type=payload_item["issue_type"],
+                location=payload_item["location"],
+                claim=payload_item["claim"],
+                description=payload_item["description"],
+                suggestion=payload_item["suggestion"],
+                evidence_ids=payload_item["evidence_ids"],
+                resolved=False,
+                created_at=_now(),
+            )
+            db.add(issue)
+            created_issues.append(issue)
+
+        critical_count = len([item for item in created_issues if item.severity == "high"])
+        draft.status = "reviewed"
+        draft.quality_score = score_quality(len(created_issues), critical_count, metrics=review_metrics)
+        db.commit()
+        complete_task(
+            task.task_id,
+            {
+                "issue_count": len(created_issues),
+                "critical_count": critical_count,
+                "publication_prepared": bool(review_metrics.get("publication_prepared")),
+                "quality_gate": review_metrics,
+            },
+        )
+        return {
+            "task_id": task.task_id,
+            "draft_id": draft.id,
+            "issue_count": len(created_issues),
+            "critical_count": critical_count,
+            "publication_prepared": bool(review_metrics.get("publication_prepared")),
+            "quality_gate": review_metrics,
+        }
+    except Exception as exc:
+        db.rollback()
+        _fail_task_for_exception(task.task_id, exc)
+        raise
+
+
+@router.post("/projects/{project_id}/revise-draft")
+def run_revision(
+    project_id: str, payload: ReviseDraftRequest, db: Session = Depends(get_db)
+) -> dict:
+    project = _get_project_or_404(project_id, db)
+    draft = _get_draft_for_project_or_404(project_id, payload.draft_id, db)
+    task = create_task("revise-draft")
+    try:
+        issues = list(
+            db.scalars(
+                select(ReviewIssue).where(ReviewIssue.draft_id == draft.id).order_by(ReviewIssue.created_at)
+            ).all()
+        )
+        revised_content = revise_draft(
+            draft.content_md,
+            issues=[
+                {
+                    "issue_type": item.issue_type,
+                    "severity": item.severity,
+                    "location": item.location,
+                }
+                for item in issues
+            ],
+        )
+        cards = list(db.scalars(select(EvidenceCard).where(EvidenceCard.project_id == project_id)).all())
+        revised_issue_payloads, revised_metrics = review_draft_with_metrics(
+            revised_content,
+            evidence_cards=[_evidence_to_dict(item) for item in cards],
+            article_type=project.article_type,
+        )
+        revised_critical_count = len([item for item in revised_issue_payloads if item.get("severity") == "high"])
+        revised_status = "publication_prepared" if revised_metrics.get("publication_prepared") else "revised_needs_human_review"
+        new_draft = Draft(
+            id=str(uuid4()),
+            project_id=project_id,
+            version=_next_draft_version(project_id, db),
+            title=(draft.title or "Draft") + " (Revised)",
+            content_md=revised_content,
+            status=revised_status,
+            quality_score=score_quality(
+                len(revised_issue_payloads),
+                revised_critical_count,
+                metrics=revised_metrics,
+            ),
+            created_at=_now(),
+        )
+        db.add(new_draft)
+        db.commit()
+        complete_task(
+            task.task_id,
+            {
+                "draft_id": new_draft.id,
+                "version": new_draft.version,
+                "publication_prepared": bool(revised_metrics.get("publication_prepared")),
+                "quality_gate": revised_metrics,
+            },
+        )
+        return {
+            "task_id": task.task_id,
+            "draft_id": new_draft.id,
+            "version": new_draft.version,
+            "publication_prepared": bool(revised_metrics.get("publication_prepared")),
+            "quality_gate": revised_metrics,
+        }
+    except Exception as exc:
+        db.rollback()
+        _fail_task_for_exception(task.task_id, exc)
+        raise

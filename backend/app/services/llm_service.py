@@ -10,11 +10,14 @@ Each provider has its own Strategy class that handles:
 from __future__ import annotations
 
 import json
+import logging
 import time
 from abc import ABC, abstractmethod
 from typing import Any
 
 from sqlalchemy import select
+
+logger = logging.getLogger(__name__)
 
 from app.database import SessionLocal
 from app.models.llm_config import LLMConfig

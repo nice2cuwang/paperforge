@@ -7,8 +7,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Draft, Project
-from app.schemas import DraftCreate, DraftRead, DraftUpdate
+from app.models import Draft, EvidenceCard, Project
+from app.schemas import DraftCreate, DraftRead, DraftUpdate, GenerateDraftRequest, GenerateOutlineRequest
+from app.services.task_registry import complete_task, create_task, _fail_task_for_exception
+from app.services.workflow.helpers import _evidence_to_dict, _next_draft_version, _now
+from app.services.writing_service import build_draft_markdown, build_outline
 
 router = APIRouter(prefix="/api", tags=["drafts"])
 
@@ -103,3 +106,83 @@ def delete_draft(draft_id: str, db: Session = Depends(get_db)) -> Response:
     db.delete(draft)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/projects/{project_id}/generate-outline")
+def generate_outline(
+    project_id: str, payload: GenerateOutlineRequest, db: Session = Depends(get_db)
+) -> dict:
+    project = _get_project_or_404(project_id, db)
+    del payload
+    task = create_task("generate-outline")
+    try:
+        cards = list(db.scalars(select(EvidenceCard).where(EvidenceCard.project_id == project_id)).all())
+        content = build_outline(
+            project_title=project.title,
+            research_question=project.research_question,
+            evidence_cards=[_evidence_to_dict(item) for item in cards],
+        )
+        draft = Draft(
+            id=str(uuid4()),
+            project_id=project_id,
+            version=_next_draft_version(project_id, db),
+            title=f"{project.title} Outline",
+            content_md=content,
+            status="outline",
+            quality_score={"overall_score": 0.7},
+            created_at=_now(),
+        )
+        db.add(draft)
+        db.commit()
+        db.refresh(draft)
+        complete_task(task.task_id, {"draft_id": draft.id, "version": draft.version})
+        return {"task_id": task.task_id, "draft_id": draft.id, "version": draft.version}
+    except Exception as exc:
+        db.rollback()
+        _fail_task_for_exception(task.task_id, exc)
+        raise
+
+
+@router.post("/projects/{project_id}/generate-draft")
+def generate_draft(
+    project_id: str, payload: GenerateDraftRequest, db: Session = Depends(get_db)
+) -> dict:
+    project = _get_project_or_404(project_id, db)
+    task = create_task("generate-draft")
+    try:
+        cards = list(db.scalars(select(EvidenceCard).where(EvidenceCard.project_id == project_id)).all())
+        if not cards:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "NO_EVIDENCE_CARDS",
+                    "title": "Cannot generate draft without evidence cards",
+                    "message": "Build evidence cards first, then generate draft.",
+                },
+            )
+        content = build_draft_markdown(
+            project_title=payload.title or project.title,
+            research_question=project.research_question,
+            article_type=project.article_type,
+            citation_style=project.citation_style,
+            evidence_cards=[_evidence_to_dict(item) for item in cards],
+        )
+        draft = Draft(
+            id=str(uuid4()),
+            project_id=project_id,
+            version=_next_draft_version(project_id, db),
+            title=payload.title or f"{project.title} Draft",
+            content_md=content,
+            status="draft",
+            quality_score={"overall_score": 0.75},
+            created_at=_now(),
+        )
+        db.add(draft)
+        db.commit()
+        db.refresh(draft)
+        complete_task(task.task_id, {"draft_id": draft.id, "version": draft.version})
+        return {"task_id": task.task_id, "draft_id": draft.id, "version": draft.version}
+    except Exception as exc:
+        db.rollback()
+        _fail_task_for_exception(task.task_id, exc)
+        raise
