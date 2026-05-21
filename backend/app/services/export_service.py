@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 
 def ensure_export_dir(base_dir: Path, project_id: str) -> Path:
@@ -94,4 +95,33 @@ def export_json(target_dir: Path, filename: str, payload: dict | list) -> Path:
     path = target_dir / filename
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def export_quality_report(
+    target_dir: Path,
+    filename: str,
+    *,
+    draft_version: int,
+    review_rounds: list[dict[str, Any]],
+    final_metrics: dict[str, Any],
+    publication_prepared: bool,
+) -> Path:
+    """Export a structured quality gate report alongside the draft."""
+    report = {
+        "report_type": "quality_gate",
+        "draft_version": draft_version,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "publication_prepared": publication_prepared,
+        "final_metrics": final_metrics,
+        "review_history": review_rounds,
+        "thresholds": {
+            "evidence_coverage": 0.90,
+            "citation_validity": 0.90,
+            "logic_score": 0.80,
+            "style_score": 0.80,
+            "critical_issues": 0,
+            "unsupported_claims": 0,
+        },
+    }
+    return export_json(target_dir, filename, report)
 

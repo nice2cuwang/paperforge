@@ -1,4 +1,4 @@
-const apiBase = (import.meta.env.VITE_API_BASE ?? "http://localhost:8010").replace(/\/$/, "");
+const apiBase = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 
 async function readErrorMessage(response: Response): Promise<string> {
   const raw = await response.text();

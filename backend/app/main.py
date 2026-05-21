@@ -22,8 +22,9 @@ from app.database import Base, engine
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Only auto-create tables in dev; production must use Alembic migrations.
-    if os.getenv("ENV", "dev").lower() in ("dev", "development"):
+    # Auto-create tables only when explicitly opted-in (local quick-start).
+    # Production and CI must use Alembic migrations.
+    if os.getenv("PAPERFORGE_AUTO_CREATE_TABLES", "").strip().lower() in ("1", "true", "yes", "on"):
         Base.metadata.create_all(bind=engine)
     yield
 

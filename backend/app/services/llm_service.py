@@ -417,6 +417,86 @@ _DEFAULT_BASE_URLS: dict[str, str] = {
 
 _NON_OPENAI_PROVIDERS: set[str] = {"anthropic"}
 
+# ---------------------------------------------------------------------------
+# Provider Capability Matrix
+# ---------------------------------------------------------------------------
+
+class ProviderCapability:
+    def __init__(
+        self,
+        json_mode: bool = True,
+        reasoning: bool = False,
+        tool_call: bool = False,
+        max_context: int = 128000,
+    ) -> None:
+        self.json_mode = json_mode
+        self.reasoning = reasoning
+        self.tool_call = tool_call
+        self.max_context = max_context
+
+
+_CAPABILITIES: dict[str, ProviderCapability] = {
+    "openai": ProviderCapability(json_mode=True, reasoning=False, tool_call=True, max_context=128000),
+    "azure_openai": ProviderCapability(json_mode=True, reasoning=False, tool_call=True, max_context=128000),
+    "anthropic": ProviderCapability(json_mode=True, reasoning=True, tool_call=True, max_context=200000),
+    "deepseek": ProviderCapability(json_mode=True, reasoning=False, tool_call=True, max_context=64000),
+    "kimi": ProviderCapability(json_mode=True, reasoning=True, tool_call=True, max_context=256000),
+    "kimi-coding": ProviderCapability(json_mode=True, reasoning=False, tool_call=True, max_context=262144),
+    "zhipu": ProviderCapability(json_mode=True, reasoning=False, tool_call=True, max_context=128000),
+    "qwen": ProviderCapability(json_mode=True, reasoning=False, tool_call=True, max_context=128000),
+    "astron-coding": ProviderCapability(json_mode=True, reasoning=False, tool_call=True, max_context=98304),
+    "local": ProviderCapability(json_mode=True, reasoning=False, tool_call=False, max_context=32768),
+}
+
+
+def get_capability(provider: str) -> ProviderCapability:
+    return _CAPABILITIES.get(provider, ProviderCapability())
+
+
+# ---------------------------------------------------------------------------
+# Retryable error classification
+# ---------------------------------------------------------------------------
+
+def _is_retryable_error(err_text: str, status_code: int | None = None) -> bool:
+    """Determine if an error is transient and worth retrying."""
+    if status_code is not None:
+        # Retryable HTTP status codes
+        if status_code in {429, 502, 503, 504}:
+            return True
+        # Non-retryable client errors
+        if status_code in {400, 401, 403, 404, 422}:
+            return False
+    text = err_text.lower()
+    retryable_keywords = [
+        "timeout",
+        "timed out",
+        "connection",
+        "connecttimeout",
+        "readtimeout",
+        "too many requests",
+        "rate limit",
+        "temporarily unavailable",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+    ]
+    if any(kw in text for kw in retryable_keywords):
+        return True
+    non_retryable_keywords = [
+        "invalid api key",
+        "incorrect api key",
+        "authentication",
+        "unauthorized",
+        "not found",
+        "bad request",
+        "context length exceeded",
+        "maximum context length",
+    ]
+    if any(kw in text for kw in non_retryable_keywords):
+        return False
+    # Default: retry network-ish errors, don't retry others
+    return "connection" in text or "timeout" in text
+
 
 def _get_active_config() -> LLMConfig | None:
     db = SessionLocal()
@@ -543,11 +623,24 @@ def chat_completion(
             latency = int((time.time() - start) * 1000)
             err_text = str(exc)
             last_error = err_text[:500]
-            if "429" in err_text or "Too Many Requests" in err_text or "ConnectTimeout" in err_text:
+            status_code: int | None = None
+            if hasattr(exc, "response") and hasattr(exc.response, "status_code"):
+                status_code = exc.response.status_code
+            elif "429" in err_text:
+                status_code = 429
+            if _is_retryable_error(err_text, status_code):
                 if attempt < max_retries - 1:
                     delay = min(max_delay, base_delay * (2 ** attempt))
+                    logger.warning(
+                        "LLM call attempt %d/%d failed (retryable: %s), retrying in %.1fs",
+                        attempt + 1,
+                        max_retries,
+                        last_error,
+                        delay,
+                    )
                     time.sleep(delay)
                     continue
+            logger.error("LLM call failed after %d attempts (non-retryable): %s", attempt + 1, last_error)
             return {"content": "", "usage": None, "latency_ms": latency, "error": last_error, "_reasoning": None}
 
         latency = int((time.time() - start) * 1000)

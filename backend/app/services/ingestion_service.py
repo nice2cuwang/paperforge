@@ -56,7 +56,19 @@ def escape_xml(value: str) -> str:
 
 
 def extract_pdf_text(pdf_path: Path) -> str:
-    # 1) Pure-Python parser.
+    # 1) Try GROBID first for structured TEI extraction.
+    try:
+        from app.services.grobid_client import parse_pdf, tei_to_plaintext
+
+        tei_text, _meta = parse_pdf(pdf_path)
+        plain = tei_to_plaintext(tei_text)
+        merged = _normalize_extracted_text(plain)
+        if _looks_like_meaningful_text(merged):
+            return merged
+    except Exception:
+        pass
+
+    # 2) Pure-Python parser.
     try:
         from pypdf import PdfReader  # type: ignore
 
@@ -72,7 +84,7 @@ def extract_pdf_text(pdf_path: Path) -> str:
     except Exception:
         pass
 
-    # 2) PyMuPDF fallback if available.
+    # 3) PyMuPDF fallback if available.
     try:
         import fitz  # type: ignore
 
@@ -88,7 +100,7 @@ def extract_pdf_text(pdf_path: Path) -> str:
     except Exception:
         pass
 
-    # 3) Last fallback: decode bytes, then aggressively filter binary/object noise.
+    # 4) Last fallback: decode bytes, then aggressively filter binary/object noise.
     raw = pdf_path.read_bytes()
     fallback = _sanitize_fallback_text(raw.decode("utf-8", errors="ignore"))
     if _looks_like_meaningful_text(fallback):

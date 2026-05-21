@@ -7,9 +7,9 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from app.database import Base, default_sqlite_url
-from app.models import Draft, EvidenceCard, Paper, PaperChunk, Project, ReviewIssue
+from app.models import Draft, EvidenceCard, LLMConfig, Paper, PaperChunk, Project, ReviewIssue
 
-del Draft, EvidenceCard, Paper, PaperChunk, Project, ReviewIssue
+del Draft, EvidenceCard, LLMConfig, Paper, PaperChunk, Project, ReviewIssue
 
 config = context.config
 

@@ -57,12 +57,27 @@ async function loadAll() {
   issues.value = await apiRequest<ReviewIssue[]>(`/api/projects/${id}/review-issues`);
 }
 
+const TASK_STORAGE_KEY = (pid: string) => `paperforge_task_${pid}`;
+
 async function pollTask(taskId: string, maxMs = 10 * 60 * 1000) {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
-    const payload = await apiRequest<TaskPayload>(`/api/tasks/${taskId}`);
-    task.value = payload;
-    if (payload.status !== "running") break;
+    try {
+      const payload = await apiRequest<TaskPayload>(`/api/tasks/${taskId}`);
+      task.value = payload;
+      if (payload.status !== "running") {
+        localStorage.removeItem(TASK_STORAGE_KEY(projectId.value));
+        break;
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "";
+      if (message.includes("404") || message.toLowerCase().includes("not found")) {
+        task.value = null;
+        localStorage.removeItem(TASK_STORAGE_KEY(projectId.value));
+        throw new Error("任务已丢失（后端可能重启）。请重新提交。");
+      }
+      throw err;
+    }
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 }
@@ -148,6 +163,7 @@ async function runAutoWorkflow() {
       }
     );
     workflowHint.value = `任务 ${payload.task_id.slice(0, 8)} 已提交，正在执行...`;
+    localStorage.setItem(TASK_STORAGE_KEY(projectId.value), payload.task_id);
     await pollTask(payload.task_id);
 
     const result = task.value?.result ?? {};
@@ -200,6 +216,18 @@ async function runAutoWorkflow() {
 onMounted(async () => {
   try {
     await loadAll();
+    const storedTaskId = localStorage.getItem(TASK_STORAGE_KEY(projectId.value));
+    if (storedTaskId && !task.value) {
+      busy.value = true;
+      workflowHint.value = `恢复任务 ${storedTaskId.slice(0, 8)} 轮询...`;
+      try {
+        await pollTask(storedTaskId);
+      } catch (err) {
+        error.value = err instanceof Error ? err.message : "恢复任务失败";
+      } finally {
+        busy.value = false;
+      }
+    }
   } catch (err) {
     error.value = err instanceof Error ? err.message : "加载失败";
   }

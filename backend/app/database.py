@@ -4,6 +4,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 backend_dir = Path(__file__).resolve().parent.parent
 data_dir = backend_dir / "data"
@@ -14,7 +15,8 @@ database_url = os.getenv("DATABASE_URL", default_sqlite_url)
 
 engine_kwargs: dict[str, object] = {}
 if database_url.startswith("sqlite"):
-    engine_kwargs["connect_args"] = {"check_same_thread": False}
+    engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
+    engine_kwargs["poolclass"] = StaticPool
 
 engine = create_engine(database_url, **engine_kwargs)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -26,6 +28,7 @@ def set_sqlite_pragma(dbapi_connection, connection_record):  # type: ignore[no-u
     if database_url.startswith("sqlite"):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=30000")
         cursor.close()
 
 

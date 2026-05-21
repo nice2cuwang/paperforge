@@ -43,6 +43,9 @@ Thumbs.db
 # ---------------------------------------------------------------------------
 backend/data/
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 *.log
@@ -56,3 +59,8 @@ backend/data/
 # Internal documentation
 PaperForge_Codex_*.md
 
+frontend/.vite/
+
+# Test & Merge artifacts
+backend/.pytest_cache/
+*.orig

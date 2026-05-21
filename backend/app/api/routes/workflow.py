@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import re
 from threading import Thread
@@ -33,6 +34,7 @@ from app.services.export_service import (
     export_json,
     export_markdown,
     export_pdf,
+    export_quality_report,
 )
 from app.services.evidence_service import build_evidence_from_chunks
 from app.services.http_client import create_httpx_client
@@ -42,10 +44,79 @@ from app.services.review_service import review_draft_with_metrics, revise_draft,
 from app.services.search_service import normalize_title, search_papers
 from app.services.task_registry import add_log, complete_task, create_task, fail_task, set_progress
 from app.services.writing_service import build_draft_markdown, build_outline
+from app.services.workflow.search_select import (
+    run_search_and_select,
+    _upsert_search_candidates,
+    _query_tokens,
+    _text_query_score,
+    _paper_query_score,
+    _paper_facet_coverage,
+)
+from app.services import embedding_service, qdrant_service
 
 router = APIRouter(prefix="/api", tags=["workflow"])
 HTTP_HEADERS = {"User-Agent": "PaperForge/0.3 (+https://paperforge.local)"}
 UNPAYWALL_EMAIL = "paperforge@local.dev"
+
+# Download security boundaries
+_DOWNLOAD_ALLOWLIST = {
+    "arxiv.org",
+    "export.arxiv.org",
+    "api.openalex.org",
+    "api.unpaywall.org",
+    "api.crossref.org",
+    "api.semanticscholar.org",
+    "doi.org",
+    "www.doi.org",
+    "link.springer.com",
+    "journals.plos.org",
+    "www.biorxiv.org",
+    "www.medrxiv.org",
+    "hal.science",
+    "hal.archives-ouvertes.fr",
+}
+
+_ALLOW_TLS_DOWNGRADE = (os.getenv("PAPERFORGE_ALLOW_TLS_DOWNGRADE") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_private_ip(host: str) -> bool:
+    """Detect private/internal IP addresses to block SSRF."""
+    if not host:
+        return True
+    host = host.lower()
+    # Block plain IP literals in production downloads (safer default)
+    if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", host):
+        parts = [int(p) for p in host.split(".")]
+        if parts[0] == 10:
+            return True
+        if parts[0] == 172 and 16 <= parts[1] <= 31:
+            return True
+        if parts[0] == 192 and parts[1] == 168:
+            return True
+        if parts[0] == 127:
+            return True
+        if parts[0] == 0:
+            return True
+        if parts[0] == 169 and parts[1] == 254:
+            return True
+    if host in {"localhost", "0.0.0.0", "::", "::1"}:
+        return True
+    return False
+
+
+def _is_safe_url(url: str) -> tuple[bool, str]:
+    """Validate that a download URL is safe. Returns (ok, reason)."""
+    url = (url or "").strip()
+    if not url:
+        return False, "URL is empty"
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        return False, f"Unsupported scheme: {scheme}"
+    hostname = (parsed.hostname or "").lower()
+    if _is_private_ip(hostname):
+        return False, f"Private/internal address blocked: {hostname}"
+    return True, ""
 
 
 def _now() -> datetime:
@@ -201,7 +272,9 @@ def _probe_pdf_url(pdf_url: str) -> bool:
     url = pdf_url.strip()
     if not url:
         return False
-    if not url.lower().startswith(("http://", "https://")):
+    safe, reason = _is_safe_url(url)
+    if not safe:
+        logger.warning("SSRF block in probe: %s", reason)
         return False
 
     try:
@@ -427,93 +500,14 @@ def _paper_has_download_potential(paper: Paper) -> bool:
     return False
 
 
-def _query_tokens(text: str) -> set[str]:
-    normalized = normalize_title(text)
-    stop_tokens = {
-        "ai",
-        "a i",
-        "model",
-        "models",
-        "llm",
-        "大模型",
-        "模型",
-        "人工智能",
-    }
-    tokens: set[str] = set()
-    for token in normalized.split():
-        if len(token) >= 2:
-            if token in stop_tokens:
-                continue
-            tokens.add(token)
-    cjk = [ch for ch in normalized if 0x4E00 <= ord(ch) <= 0x9FFF]
-    for idx in range(len(cjk) - 1):
-        token2 = cjk[idx] + cjk[idx + 1]
-        if token2 in stop_tokens:
-            continue
-        tokens.add(token2)
-    for idx in range(len(cjk) - 2):
-        token3 = cjk[idx] + cjk[idx + 1] + cjk[idx + 2]
-        if token3 in stop_tokens:
-            continue
-        tokens.add(token3)
-    return tokens
 
 
-def _required_facets(text: str) -> list[str]:
-    query = (text or "").lower()
-    facets: list[str] = []
-    if any(token in query for token in ["ai", "人工智能", "大模型", "llm", "machine learning"]):
-        facets.append("ai")
-    if any(token in query for token in ["学习路线", "学习路径", "路线图", "roadmap", "learning path", "pathway", "curriculum"]):
-        facets.append("path")
-    if any(token in query for token in ["小白", "入门", "新手", "beginner", "novice", "introductory"]):
-        facets.append("beginner")
-    return facets
 
 
-def _paper_facet_coverage(paper: Paper, query: str) -> float:
-    facets = _required_facets(query)
-    if not facets:
-        return 1.0
-    hay = normalize_title(" ".join([paper.title or "", paper.abstract or "", paper.venue or ""]))
-    if not hay:
-        return 0.0
-    covered = 0
-    for facet in facets:
-        if facet == "ai":
-            if any(token in hay for token in ["ai", "artificial intelligence", "llm", "machine learning", "deep learning", "人工智能", "大模型"]):
-                covered += 1
-        elif facet == "path":
-            if any(token in hay for token in ["learning path", "roadmap", "pathway", "curriculum", "课程", "学习路径", "学习路线"]):
-                covered += 1
-        elif facet == "beginner":
-            if any(token in hay for token in ["beginner", "novice", "introductory", "for dummies", "入门", "新手", "小白"]):
-                covered += 1
-    return covered / max(1, len(facets))
 
 
-def _paper_query_score(paper: Paper, query: str) -> float:
-    tokens = _query_tokens(query)
-    if not tokens:
-        return 0.0
-    haystack = normalize_title(" ".join([paper.title or "", paper.abstract or "", paper.venue or ""]))
-    if not haystack:
-        return 0.0
-    hits = sum(1 for token in tokens if token in haystack)
-    lexical = hits / max(1, len(tokens))
-    facet = _paper_facet_coverage(paper, query)
-    return 0.6 * lexical + 0.4 * facet
 
 
-def _text_query_score(text: str, query: str) -> float:
-    tokens = _query_tokens(query)
-    if not tokens:
-        return 0.0
-    haystack = normalize_title(text or "")
-    if not haystack:
-        return 0.0
-    hits = sum(1 for token in tokens if token in haystack)
-    return hits / max(1, len(tokens))
 
 
 def _provider_diagnostics() -> dict[str, str]:
@@ -533,26 +527,8 @@ def _provider_diagnostics() -> dict[str, str]:
     return diagnostics
 
 
-def _candidate_identity_keys(candidate: Any) -> set[str]:
-    keys: set[str] = set()
-    doi = _normalize_doi(getattr(candidate, "doi", None))
-    if doi:
-        keys.add(f"doi:{doi.lower()}")
-    title = normalize_title(str(getattr(candidate, "title", "") or ""))
-    if title:
-        keys.add(f"title:{title}")
-    return keys
 
 
-def _paper_identity_keys(paper: Paper) -> set[str]:
-    keys: set[str] = set()
-    doi = _normalize_doi(paper.doi)
-    if doi:
-        keys.add(f"doi:{doi.lower()}")
-    title = normalize_title(paper.title or "")
-    if title:
-        keys.add(f"title:{title}")
-    return keys
 
 
 def _is_fallback_source(paper: Paper) -> bool:
@@ -588,6 +564,12 @@ def _iter_pdf_url_candidates(paper: Paper, primary_url: str) -> list[str]:
 
 
 def _download_pdf_bytes(url: str, verify_tls: bool = True) -> tuple[bytes, str]:
+    safe, reason = _is_safe_url(url)
+    if not safe:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "SSRF_BLOCKED", "message": reason, "url": url},
+        )
     with create_httpx_client(
         timeout=25.0,
         headers=HTTP_HEADERS,
@@ -641,7 +623,7 @@ def _download_pdf_for_paper(
             attempt_logs.append(f"{candidate_url}: {exc}")
             parsed = urlparse(candidate_url)
             is_https = parsed.scheme == "https"
-            if is_https and "ssl" in str(exc).lower():
+            if is_https and "ssl" in str(exc).lower() and _ALLOW_TLS_DOWNGRADE:
                 try:
                     content, content_type = _download_pdf_bytes(candidate_url, verify_tls=False)
                     downloaded_from = candidate_url
@@ -764,56 +746,35 @@ def _parse_paper_to_chunks(paper: Paper, db: Session, chunk_size: int) -> int:
                 created_at=_now(),
             )
         )
+
+    # Vectorize and upsert to Qdrant
+    try:
+        chunk_texts = [c["text"] for c in chunks if c.get("text")]
+        if chunk_texts:
+            embeddings = embedding_service.encode_texts(chunk_texts)
+            payloads = [
+                {
+                    "project_id": paper.project_id,
+                    "paper_id": paper.id,
+                    "paper_title": paper.title,
+                    "page_start": c.get("page_start"),
+                    "page_end": c.get("page_end"),
+                    "text_preview": (c.get("text") or "")[:500],
+                }
+                for c in chunks
+            ]
+            chunk_ids = [c["id"] for c in chunks]
+            qdrant_service.upsert_chunks(chunk_ids=chunk_ids, embeddings=embeddings, payloads=payloads)
+            logger.info("Vectorized %d chunks for paper %s", len(chunks), paper.id)
+    except Exception as exc:
+        logger.warning("Qdrant upsert failed for paper %s: %s (proceeding without vectors)", paper.id, exc)
+
     paper.local_tei_path = str(tei_path)
     paper.parse_status = "parsed"
     paper.updated_at = _now()
     return len(chunks)
 
 
-def _upsert_search_candidates(project_id: str, query: str, candidates: list, db: Session) -> int:
-    existing = list(db.scalars(select(Paper).where(Paper.project_id == project_id)).all())
-    existing_doi = {item.doi.lower().strip() for item in existing if item.doi}
-    existing_titles = {normalize_title(item.title) for item in existing}
-
-    inserted = 0
-    now = _now()
-    for candidate in candidates:
-        doi = candidate.doi.lower().strip() if candidate.doi else None
-        title_key = normalize_title(candidate.title)
-        if doi and doi in existing_doi:
-            continue
-        if title_key in existing_titles:
-            continue
-        paper = Paper(
-            id=str(uuid4()),
-            project_id=project_id,
-            title=candidate.title,
-            authors=candidate.authors,
-            year=candidate.year,
-            doi=candidate.doi,
-            arxiv_id=candidate.arxiv_id,
-            venue=candidate.venue,
-            abstract=candidate.abstract,
-            source=candidate.source,
-            source_url=candidate.source_url,
-            pdf_url=candidate.pdf_url,
-            oa_status=candidate.oa_status,
-            license=candidate.license,
-            local_pdf_path=None,
-            local_tei_path=None,
-            relevance_score=candidate.relevance_score,
-            selected=False,
-            parse_status="pending",
-            metadata_json={"query": query},
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(paper)
-        inserted += 1
-        if doi:
-            existing_doi.add(doi)
-        existing_titles.add(title_key)
-    return inserted
 
 
 def _timestamp() -> str:
@@ -852,6 +813,49 @@ def search_project_papers(
         db.rollback()
         _fail_task_for_exception(task.task_id, exc)
         raise
+
+
+import os
+
+_MAX_UPLOAD_SIZE_MB = int(os.getenv("PAPERFORGE_MAX_UPLOAD_SIZE_MB", "50"))
+_UPLOAD_ALLOWED_EXTENSIONS = {".pdf"}
+_UPLOAD_ALLOWED_MIME_TYPES = {"application/pdf", "application/octet-stream"}
+
+
+def _validate_upload_file(file: UploadFile, content: bytes) -> None:
+    max_bytes = _MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={
+                "code": "UPLOAD_TOO_LARGE",
+                "message": f"File size exceeds limit of {_MAX_UPLOAD_SIZE_MB}MB",
+                "limit_mb": _MAX_UPLOAD_SIZE_MB,
+                "received_bytes": len(content),
+            },
+        )
+
+    filename = (file.filename or "").lower()
+    if not any(filename.endswith(ext) for ext in _UPLOAD_ALLOWED_EXTENSIONS):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail={
+                "code": "UPLOAD_INVALID_EXTENSION",
+                "message": f"Only {', '.join(_UPLOAD_ALLOWED_EXTENSIONS)} files are allowed",
+            },
+        )
+
+    content_type = (file.content_type or "").lower()
+    if content_type and content_type not in _UPLOAD_ALLOWED_MIME_TYPES:
+        # Allow empty/unknown content_type, but reject explicitly wrong ones
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail={
+                "code": "UPLOAD_INVALID_MIME",
+                "message": f"MIME type '{content_type}' not allowed",
+                "allowed": list(_UPLOAD_ALLOWED_MIME_TYPES),
+            },
+        )
 
 
 @router.post("/projects/{project_id}/papers/upload")
@@ -901,6 +905,8 @@ async def upload_paper_pdf(
     content = await file.read()
     if not content:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty")
+
+    _validate_upload_file(file, content)
 
     saved = save_uploaded_pdf(
         base_dir=backend_dir / "data",
@@ -1042,188 +1048,49 @@ def download_selected_papers(
 def _execute_auto_workflow(
     project_id: str, payload: RunAutoWorkflowRequest, db: Session, task_id: str
 ) -> dict:
+    add_log(task_id, "enter _execute_auto_workflow")
     project = _get_project_or_404(project_id, db)
+    add_log(task_id, f"project loaded: {project.title}")
     query = (payload.query or project.research_question or project.title).strip()
     if not query:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Search query is empty")
 
-    set_progress(task_id, 5, "searching papers")
-    candidates = search_papers(query=query, limit=payload.max_results)
-    inserted = _upsert_search_candidates(project_id=project_id, query=query, candidates=candidates, db=db)
-    # SessionLocal is configured with autoflush=False; flush explicitly so newly inserted
-    # candidates are visible to the subsequent in-transaction query/autoselect logic.
-    db.flush()
-    add_log(task_id, f"search done: candidates={len(candidates)}, inserted={inserted}")
-
-    papers = list(db.scalars(select(Paper).where(Paper.project_id == project_id)).all())
-    selected_papers = [item for item in papers if item.selected]
-    preselected_papers = list(selected_papers)
-
-    candidate_keys: set[str] = set()
-    for candidate in candidates:
-        candidate_keys.update(_candidate_identity_keys(candidate))
-    query_scoped_papers = [item for item in papers if _paper_identity_keys(item) & candidate_keys]
-    if query_scoped_papers:
-        add_log(task_id, f"query-scoped pool prepared: {len(query_scoped_papers)} papers from current search")
-
-    auto_selected_count = 0
-    reselection_triggered = False
-    if selected_papers and not payload.keep_manual_selection:
-        reselection_triggered = True
-        now = _now()
-        for item in selected_papers:
-            item.selected = False
-            item.updated_at = now
-        selected_papers = []
-        add_log(task_id, "manual selection reset: auto workflow runs with query-driven reselection by default")
-
-    if selected_papers:
-        selected_with_potential = [item for item in selected_papers if _paper_has_download_potential(item)]
-        selected_scores = [_paper_query_score(item, query) for item in selected_papers]
-        selected_facets = [_paper_facet_coverage(item, query) for item in selected_papers]
-        max_selected_score = max(selected_scores) if selected_scores else 0.0
-        avg_selected_score = (sum(selected_scores) / len(selected_scores)) if selected_scores else 0.0
-        max_facet = max(selected_facets) if selected_facets else 0.0
-        avg_facet = (sum(selected_facets) / len(selected_facets)) if selected_facets else 0.0
-        low_relevance_selection = (
-            max_selected_score < 0.16
-            and avg_selected_score < 0.10
-            and max_facet < 0.67
-            and avg_facet < 0.5
-        )
-        if (
-            len(selected_with_potential) == 0
-            or len(selected_papers) > payload.auto_select_limit
-            or (low_relevance_selection and not payload.keep_manual_selection)
-        ):
-            reselection_triggered = True
-            now = _now()
-            for item in selected_papers:
-                item.selected = False
-                item.updated_at = now
-            selected_papers = []
-            add_log(
-                task_id,
-                "manual selection reset: stale selection had low download potential, weak relevance, or exceeded limit",
-            )
-
-    if not selected_papers and not query_scoped_papers and not payload.keep_manual_selection:
-        rescue_pool = [
-            item
-            for item in preselected_papers
-            if not _is_fallback_source(item)
-            and (_resolve_local_pdf_path(item.local_pdf_path) is not None or _paper_has_download_potential(item))
-        ]
-        if rescue_pool:
-            rescue_ranked = sorted(
-                rescue_pool,
-                key=lambda item: (
-                    1 if _resolve_local_pdf_path(item.local_pdf_path) else 0,
-                    1 if item.parse_status == "parsed" else 0,
-                    _paper_query_score(item, query),
-                    float(item.relevance_score or 0.0),
-                ),
-                reverse=True,
-            )[: payload.auto_select_limit]
-            now = _now()
-            for item in rescue_ranked:
-                item.selected = True
-                item.updated_at = now
-            selected_papers = rescue_ranked
-            add_log(
-                task_id,
-                f"search empty fallback: reused {len(selected_papers)} manually selected trusted papers",
-            )
-        else:
-            provider_diag = _provider_diagnostics()
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "code": "SEARCH_NO_CANDIDATES",
-                    "title": "No credible papers found from current search",
-                    "message": (
-                        "Current query returned no usable real candidates from external providers. "
-                        "Auto workflow stopped to avoid writing from stale or synthetic papers."
-                    ),
-                    "summary": {
-                        "query": query,
-                        "provider_candidate_count": len(candidates),
-                        "inserted_count": inserted,
-                    },
-                    "provider_diagnostics": provider_diag,
-                    "next_actions": [
-                        "Check backend network connectivity to OpenAlex/Crossref/arXiv.",
-                        "If you use a local proxy, set PAPERFORGE_PROXY_URL=http://host.docker.internal:<port> in .env.",
-                        "Or run backend outside Docker and retry search.",
-                        "If you already selected trusted local papers, run with keep_manual_selection=true.",
-                    ],
-                },
-            )
-
+    add_log(task_id, f"starting search_and_select: query={query[:80]}")
+    selected_papers, inserted, reselection_triggered = run_search_and_select(
+        project_id=project_id,
+        query=query,
+        auto_select_limit=payload.auto_select_limit,
+        keep_manual_selection=payload.keep_manual_selection,
+        max_results=payload.max_results,
+        db=db,
+        task_id=task_id,
+    )
+    add_log(task_id, f"search_and_select done: selected={len(selected_papers)}, inserted={inserted}")
+    candidates: list[Any] = []  # populated below if needed for diagnostics
     if not selected_papers:
-        selection_pool = query_scoped_papers or papers
-        non_fallback_pool = [item for item in selection_pool if not _is_fallback_source(item)]
-        if non_fallback_pool:
-            selection_pool = non_fallback_pool
-        if query_scoped_papers:
-            add_log(task_id, "auto-select scope: current-search papers only")
-        else:
-            add_log(task_id, "auto-select scope: all project papers (no current-search overlap)")
-
-        required_facets = _required_facets(query)
-        scored_pool: list[tuple[float, float, Paper]] = [
-            (_paper_query_score(item, query), _paper_facet_coverage(item, query), item) for item in selection_pool
-        ]
-        max_query_score = max((score for score, _, _ in scored_pool), default=0.0)
-
-        if len(required_facets) >= 2:
-            strict = [item for score, facet, item in scored_pool if score >= 0.18 and facet >= 0.67]
-            if strict:
-                scoped_pool = strict
-            else:
-                scoped_pool = [item for score, facet, item in scored_pool if score >= 0.12 and facet >= 0.5]
-        elif max_query_score >= 0.10:
-            floor = max(0.06, max_query_score * 0.5)
-            scoped_pool = [item for score, _, item in scored_pool if score >= floor]
-        else:
-            scoped_pool = [item for _, _, item in scored_pool]
-
-        ranked = sorted(
-            scoped_pool,
-            key=lambda item: (
-                _paper_query_score(item, query),
-                _paper_facet_coverage(item, query),
-                float(item.relevance_score or 0.0),
-                1 if not _is_fallback_source(item) else 0,
-                1 if _paper_has_download_potential(item) else 0,
-                1 if _resolve_local_pdf_path(item.local_pdf_path) else 0,
-                1 if _resolve_pdf_url(item) else 0,
-                1 if item.doi else 0,
-            ),
-            reverse=True,
-        )
-        selected_papers = ranked[: payload.auto_select_limit]
-        now = _now()
-        for item in selected_papers:
-            item.selected = True
-            item.updated_at = now
-            if _is_fallback_source(item):
-                item.local_pdf_path = None
-                item.pdf_url = None
-                item.parse_status = "pending"
-        auto_selected_count = len(selected_papers)
-        add_log(
-            task_id,
-            f"auto-selected papers: {auto_selected_count}"
-            + (" (reselection mode)" if reselection_triggered else ""),
-        )
-    else:
-        add_log(task_id, f"using manually selected papers: {len(selected_papers)}")
-
-    if not selected_papers:
+        provider_diag = _provider_diagnostics()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No papers available for workflow. Run search or add papers first.",
+            detail={
+                "code": "SEARCH_NO_CANDIDATES",
+                "title": "No credible papers found from current search",
+                "message": (
+                    "Current query returned no usable real candidates from external providers. "
+                    "Auto workflow stopped to avoid writing from stale or synthetic papers."
+                ),
+                "summary": {
+                    "query": query,
+                    "provider_candidate_count": 0,
+                    "inserted_count": inserted,
+                },
+                "provider_diagnostics": provider_diag,
+                "next_actions": [
+                    "Check backend network connectivity to OpenAlex/Crossref/arXiv.",
+                    "If you use a local proxy, set PAPERFORGE_PROXY_URL=http://host.docker.internal:<port> in .env.",
+                    "Or run backend outside Docker and retry search.",
+                    "If you already selected trusted local papers, run with keep_manual_selection=true.",
+                ],
+            },
         )
 
     set_progress(task_id, 30, "downloading and parsing selected papers")
@@ -1297,6 +1164,7 @@ def _execute_auto_workflow(
             paper_diagnostics.append(paper_diag)
 
     db.flush()
+    add_log(task_id, "db flushed after paper processing")
     set_progress(task_id, 66, "building evidence cards")
     db.execute(delete(EvidenceCard).where(EvidenceCard.project_id == project_id))
     evidence_count = 0
@@ -1459,6 +1327,7 @@ def _execute_auto_workflow(
         )
 
     cards = list(db.scalars(select(EvidenceCard).where(EvidenceCard.project_id == project_id)).all())
+    add_log(task_id, f"evidence cards built: {len(cards)}")
     set_progress(task_id, 78, "generating draft")
     draft = Draft(
         id=str(uuid4()),
@@ -1479,6 +1348,8 @@ def _execute_auto_workflow(
     db.add(draft)
     db.flush()
 
+    db.flush()
+    add_log(task_id, "draft generated and flushed")
     set_progress(task_id, 86, "reviewing draft")
     review_payloads, review_metrics = review_draft_with_metrics(
         draft.content_md,
@@ -1524,6 +1395,15 @@ def _execute_auto_workflow(
     best_metrics = current_metrics
     best_score = previous_overall
 
+    # Quality gate snapshot history
+    review_rounds: list[dict[str, Any]] = [
+        {
+            "round": 0,
+            "stage": "initial_review",
+            "metrics": dict(review_metrics),
+        }
+    ]
+
     for round_index in range(1, max_revision_rounds + 1):
         if bool(current_metrics.get("publication_prepared")):
             add_log(task_id, f"revision stop: publication gate passed before round {round_index}")
@@ -1555,6 +1435,15 @@ def _execute_auto_workflow(
             f"revision round {round_index}: overall={overall:.3f}, delta={improvement:.3f}, "
             f"critical={revised_metrics.get('critical_issues')}, "
             f"unsupported={revised_metrics.get('unsupported_claims')}",
+        )
+
+        review_rounds.append(
+            {
+                "round": round_index,
+                "stage": "revision",
+                "metrics": dict(revised_metrics),
+                "improvement": round(improvement, 6),
+            }
         )
 
         if overall > best_score:
@@ -1603,6 +1492,7 @@ def _execute_auto_workflow(
     db.flush()
 
     export_files: dict[str, str] = {}
+    add_log(task_id, f"revision done: rounds={rounds_executed}, best_score={best_score:.3f}")
     if payload.auto_export:
         set_progress(task_id, 97, "exporting package")
         target_dir = ensure_export_dir(backend_dir / "data", project_id)
@@ -1663,6 +1553,16 @@ def _execute_auto_workflow(
                 ]
             )
         review_path = export_markdown(target_dir, f"review_report_{stamp}.md", "\n".join(review_lines))
+
+        quality_path = export_quality_report(
+            target_dir,
+            f"quality_report_{stamp}.json",
+            draft_version=revised_draft.version,
+            review_rounds=review_rounds,
+            final_metrics=dict(revised_metrics),
+            publication_prepared=bool(revised_metrics.get("publication_prepared")),
+        )
+
         export_files = {
             "markdown": str(md_path),
             "docx": str(docx_path),
@@ -1670,6 +1570,7 @@ def _execute_auto_workflow(
             "bibtex": str(bib_path),
             "evidence_map": str(evidence_map_path),
             "review_report": str(review_path),
+            "quality_report": str(quality_path),
         }
 
     db.commit()
@@ -1720,21 +1621,27 @@ def run_auto_workflow_async(
     project_id: str, payload: RunAutoWorkflowRequest, db: Session = Depends(get_db)
 ) -> dict:
     _get_project_or_404(project_id, db)
+    db.close()  # close main thread session before starting worker to avoid shared-connection ROLLBACK
     task = create_task("run-auto-workflow")
     payload_data = payload.model_dump()
 
     def _runner() -> None:
+        add_log(task.task_id, "worker thread started")
         worker_db = SessionLocal()
+        add_log(task.task_id, "worker db session created")
         try:
             worker_payload = RunAutoWorkflowRequest.model_validate(payload_data)
+            add_log(task.task_id, "payload validated")
             result = _execute_auto_workflow(
                 project_id=project_id,
                 payload=worker_payload,
                 db=worker_db,
                 task_id=task.task_id,
             )
+            add_log(task.task_id, "workflow execution finished")
             complete_task(task.task_id, result)
         except Exception as exc:  # noqa: BLE001
+            add_log(task.task_id, f"worker exception: {exc}")
             worker_db.rollback()
             _fail_task_for_exception(task.task_id, exc)
         finally:
