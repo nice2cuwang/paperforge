@@ -111,8 +111,25 @@ FACET_LIBRARY: dict[str, dict[str, list[str]]] = {
 }
 
 
+# Common CJK function words — removing them early prevents noisy bigrams
+# when long CJK phrases are tokenised.
+_CJK_STOPWORDS: set[str] = {
+    "的", "了", "在", "是", "和", "与", "为", "对", "等", "之",
+    "及", "或", "有", "一个", "一种", "以及", "对于", "关于",
+    "通过", "进行", "采用", "基于", "使用", "提出", "实现",
+}
+
+
 def normalize_title(value: str) -> str:
-    return " ".join("".join(ch.lower() if ch.isalnum() else " " for ch in value).split())
+    text = "".join(ch.lower() if ch.isalnum() else " " for ch in value)
+    # Keep CJK character sequences intact so multi-character words survive.
+    # Only insert boundaries between CJK and Latin/digit tokens.
+    text = re.sub(r"([a-z0-9])([一-鿿])", r"\1 \2", text)
+    text = re.sub(r"([一-鿿])([a-z0-9])", r"\1 \2", text)
+    # Strip common CJK function words to reduce noise in tokenisation
+    for sw in _CJK_STOPWORDS:
+        text = text.replace(sw, " ")
+    return " ".join(text.split())
 
 
 def _clean(value: Any) -> str | None:
@@ -172,6 +189,21 @@ def _extract_query_terms(query: str) -> list[str]:
         "about",
         "paper",
         "report",
+        # CJK stopwords — common function words that carry no semantic weight
+        "的",
+        "了",
+        "在",
+        "是",
+        "和",
+        "与",
+        "为",
+        "对",
+        "等",
+        "之",
+        "及",
+        "或",
+        "有",
+        "一个",
     }
 
     terms: list[str] = []
@@ -183,7 +215,13 @@ def _extract_query_terms(query: str) -> list[str]:
             if len(token) >= 2:
                 terms.append(token)
             continue
-        if len(token) <= 4:
+        # For non-Latin tokens (CJK, etc.): single characters have no
+        # discriminative power and cause every CJK document to look like a match.
+        if len(token) < 2:
+            continue
+        # Keep CJK phrases up to 6 chars intact (common technical terms like
+        # "自然语言处理").  Only shard extremely long runs into bigrams.
+        if len(token) <= 6:
             terms.append(token)
         else:
             terms.extend(token[i : i + 2] for i in range(0, len(token) - 1))
@@ -207,36 +245,43 @@ def _detect_required_facets(query: str) -> list[str]:
     return required
 
 
+# Facets whose signals are genuine technical/academic synonyms worth
+# blending into search queries.  Audience/intent facets (learning_path,
+# college_student) expand to generic terms that lose the original subject.
+_SEARCH_EXPAND_FACETS = {"ai_model"}
+
+
 def _build_query_variants(query: str) -> list[str]:
     base = query.strip()
     if not base:
         return [query]
 
-    required = _detect_required_facets(base)
     variants = [base]
 
-    if required:
+    key_terms = _extract_query_terms(base)
+    if key_terms:
+        # Focused variant: drop noise words so databases match the salient concepts
+        variants.append(" ".join(key_terms[:8]))
+
+    required = _detect_required_facets(base)
+    # For CJK-heavy queries, facet expansion tends to produce generic
+    # English phrases (e.g. "learning path curriculum") that ignore the
+    # core entity (e.g. "deepseek").  Skip expansion in that case.
+    cjk_ratio = sum(1 for ch in base if "一" <= ch <= "鿿") / max(1, len(base))
+    if cjk_ratio < 0.35 and required:
         english_terms: list[str] = []
-        chinese_terms: list[str] = []
         for facet in required:
+            if facet not in _SEARCH_EXPAND_FACETS:
+                continue
             for signal in FACET_LIBRARY[facet]["signals"]:
                 signal_norm = normalize_title(signal)
                 if not signal_norm:
                     continue
                 if re.fullmatch(r"[a-z0-9 ]+", signal_norm):
                     english_terms.append(signal_norm)
-                else:
-                    chinese_terms.append(signal)
-
         if english_terms:
             variants.append(" ".join(dict.fromkeys(english_terms[:8])))
             variants.append(f"{base} {' '.join(dict.fromkeys(english_terms[:5]))}")
-        if chinese_terms:
-            variants.append(" ".join(dict.fromkeys(chinese_terms[:6])))
-
-    key_terms = _extract_query_terms(base)
-    if key_terms:
-        variants.append(" ".join(key_terms[:10]))
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -450,6 +495,8 @@ def _facet_coverage_ratio(query: str, candidate: PaperCandidate) -> tuple[float,
 
 
 def search_papers(query: str, limit: int = 20) -> list[PaperCandidate]:
+    from app.middleware.metrics import metrics_inc_tagged
+
     variants = _build_query_variants(query)
     providers = [_search_openalex, _search_crossref, _search_arxiv]
 
@@ -459,7 +506,9 @@ def search_papers(query: str, limit: int = 20) -> list[PaperCandidate]:
         for provider in providers:
             try:
                 collected.extend(provider(variant, provider_limit))
+                metrics_inc_tagged("paperforge_search_api_calls", f"{provider.__name__}.ok")
             except Exception:
+                metrics_inc_tagged("paperforge_search_api_calls", f"{provider.__name__}.err")
                 continue
 
     if not collected:

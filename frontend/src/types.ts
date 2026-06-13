@@ -44,6 +44,7 @@ export type EvidenceCard = {
   claim: string;
   supporting_text: string;
   evidence_type: string | null;
+  source_type: string | null;
   strength: string | null;
   limitations: string | null;
   page_start: number | null;
@@ -176,4 +177,30 @@ export type LLMTestResult = {
   message: string;
   model: string | null;
   usage: Record<string, unknown> | null;
+};
+
+/* ── Chat-first types ─────────────────────────────── */
+
+export type AgentType = "research" | "evidence" | "writing" | "review" | "editor" | "user" | "system";
+
+export type ChatMessageType =
+  | "status"
+  | "search"
+  | "evidence"
+  | "draft"
+  | "review"
+  | "revision"
+  | "command"
+  | "export"
+  | "progress"
+  | "debate";
+
+export type ChatMessage = {
+  id: string;
+  agent: AgentType;
+  type: ChatMessageType;
+  text: string;
+  data?: Record<string, unknown>;
+  draftId?: string;
+  timestamp: number;
 };

@@ -9,9 +9,11 @@ Each provider has its own Strategy class that handles:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
+import uuid
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -20,6 +22,7 @@ from sqlalchemy import select
 logger = logging.getLogger(__name__)
 
 from app.database import SessionLocal
+from app.models.audit_log import AuditLog
 from app.models.llm_config import LLMConfig
 from app.services.http_client import create_httpx_client
 
@@ -535,6 +538,53 @@ def _build_headers(config: LLMConfig) -> dict[str, str]:
 # Public API
 # ---------------------------------------------------------------------------
 
+def _persist_audit(
+    call_id: str,
+    task_id: str | None,
+    provider: str,
+    model: str,
+    strategy_mode: str | None,
+    system_prompt_hash: str,
+    user_prompt_hash: str,
+    temperature: float | None,
+    max_tokens: int | None,
+    response_format: dict[str, str] | None,
+    latency_ms: int,
+    usage: dict | None,
+    error: str | None,
+    reasoning: str | None,
+) -> None:
+    try:
+        db = SessionLocal()
+        db.add(
+            AuditLog(
+                id=str(uuid.uuid4()),
+                call_id=call_id,
+                task_id=task_id,
+                provider=provider,
+                model=model,
+                strategy_mode=strategy_mode,
+                system_prompt_hash=system_prompt_hash,
+                user_prompt_hash=user_prompt_hash,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=json.dumps(response_format) if response_format else None,
+                latency_ms=latency_ms,
+                usage=usage,
+                error=error,
+                reasoning=reasoning,
+            )
+        )
+        db.commit()
+    except Exception:
+        logger.exception("Failed to persist audit log")
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
 def chat_completion(
     system_prompt: str,
     user_prompt: str,
@@ -543,6 +593,7 @@ def chat_completion(
     max_tokens: int | None = None,
     timeout: float | None = None,
     response_format: dict[str, str] | None = None,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     """Call the active LLM using the provider's Strategy.
 
@@ -555,18 +606,26 @@ def chat_completion(
             "_reasoning": str | None,
         }
     """
+    call_id = str(uuid.uuid4())
+    system_prompt_hash = hashlib.sha256((system_prompt or "").encode("utf-8")).hexdigest()
+    user_prompt_hash = hashlib.sha256((user_prompt or "").encode("utf-8")).hexdigest()
+
     config = _get_active_config()
     if config is None:
-        return {"content": "", "usage": None, "latency_ms": 0, "error": "No active LLM config found", "_reasoning": None}
+        result = {"content": "", "usage": None, "latency_ms": 0, "error": "No active LLM config found", "_reasoning": None}
+        _persist_audit(call_id, task_id, "", "", None, system_prompt_hash, user_prompt_hash, temperature, max_tokens, response_format, 0, None, result["error"], None)
+        return result
 
     if config.provider in _NON_OPENAI_PROVIDERS:
-        return {
+        result = {
             "content": "",
             "usage": None,
             "latency_ms": 0,
             "error": f"Provider '{config.provider}' is not yet supported by llm_service (OpenAI-compatible only)",
             "_reasoning": None,
         }
+        _persist_audit(call_id, task_id, config.provider, config.model, config.strategy_mode, system_prompt_hash, user_prompt_hash, temperature, max_tokens, response_format, 0, None, result["error"], None)
+        return result
 
     strategy = get_strategy(config.provider)
 
@@ -644,12 +703,34 @@ def chat_completion(
                     time.sleep(delay)
                     continue
             logger.error("LLM call failed after %d attempts (non-retryable): %s", attempt + 1, last_error)
-            return {"content": "", "usage": None, "latency_ms": latency, "error": last_error, "_reasoning": None}
+            try:
+                from app.middleware.metrics import metrics_inc_tagged
+                metrics_inc_tagged("paperforge_llm_api_calls", f"{config.provider}.err")
+            except Exception:
+                pass
+            result = {"content": "", "usage": None, "latency_ms": latency, "error": last_error, "_reasoning": None}
+            _persist_audit(call_id, task_id, config.provider, config.model, config.strategy_mode, system_prompt_hash, user_prompt_hash, temperature, max_tokens, response_format, latency, None, result["error"], None)
+            return result
 
         latency = int((time.time() - start) * 1000)
-        return {**strategy.parse_response(data), "latency_ms": latency}
+        try:
+            from app.middleware.metrics import metrics_inc_tagged
+            metrics_inc_tagged("paperforge_llm_api_calls", f"{config.provider}.ok")
+        except Exception:
+            pass
+        parsed = strategy.parse_response(data)
+        result = {**parsed, "latency_ms": latency}
+        _persist_audit(call_id, task_id, config.provider, config.model, config.strategy_mode, system_prompt_hash, user_prompt_hash, temperature, max_tokens, response_format, latency, parsed.get("usage"), parsed.get("error"), parsed.get("_reasoning"))
+        return result
 
-    return {"content": "", "usage": None, "latency_ms": 0, "error": last_error or "Max retries exceeded", "_reasoning": None}
+    try:
+        from app.middleware.metrics import metrics_inc_tagged
+        metrics_inc_tagged("paperforge_llm_api_calls", f"{config.provider}.exhausted")
+    except Exception:
+        pass
+    result = {"content": "", "usage": None, "latency_ms": 0, "error": last_error or "Max retries exceeded", "_reasoning": None}
+    _persist_audit(call_id, task_id, config.provider, config.model, config.strategy_mode, system_prompt_hash, user_prompt_hash, temperature, max_tokens, response_format, 0, None, result["error"], None)
+    return result
 
 
 def chat_completion_text(
@@ -659,6 +740,7 @@ def chat_completion_text(
     temperature: float | None = None,
     max_tokens: int | None = None,
     timeout: float | None = None,
+    task_id: str | None = None,
 ) -> str:
     """Convenience wrapper returning only text (empty string on error)."""
     result = chat_completion(
@@ -667,6 +749,7 @@ def chat_completion_text(
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=timeout,
+        task_id=task_id,
     )
     return result.get("content") or ""
 
@@ -678,6 +761,7 @@ def chat_completion_json(
     temperature: float | None = None,
     max_tokens: int | None = None,
     timeout: float | None = None,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     """Convenience wrapper forcing JSON mode and parsing the result.
 
@@ -690,6 +774,7 @@ def chat_completion_json(
         max_tokens=max_tokens,
         timeout=timeout,
         response_format={"type": "json_object"},
+        task_id=task_id,
     )
     text = result.get("content") or ""
     if not text:

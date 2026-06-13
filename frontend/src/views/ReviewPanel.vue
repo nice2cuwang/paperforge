@@ -119,10 +119,12 @@ onMounted(async () => {
 .page {
   display: grid;
   gap: 1rem;
+  max-width: 1100px;
 }
 
 .head h1 {
   margin: 0;
+  font-family: var(--font-display);
 }
 
 .head p {
@@ -134,9 +136,10 @@ onMounted(async () => {
 .exports,
 .issues {
   border: 1px solid var(--line);
-  border-radius: 14px;
-  background: #fff;
+  border-radius: var(--radius-md);
+  background: var(--surface);
   padding: 0.8rem;
+  box-shadow: var(--shadow-sm);
 }
 
 .controls {
@@ -153,14 +156,14 @@ label {
 
 select {
   border: 1px solid #bfd0e5;
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   padding: 0.45rem 0.62rem;
 }
 
 button {
   border: 0;
-  border-radius: 10px;
-  background: #0c6dd8;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
   color: #fff;
   padding: 0.48rem 0.72rem;
   cursor: pointer;
@@ -172,9 +175,19 @@ button {
   gap: 0.6rem;
 }
 
+.export-grid button {
+  background: var(--surface-strong);
+  border: 1px solid var(--line);
+  color: var(--ink-soft);
+}
+
+.export-grid button:hover {
+  border-color: var(--accent-muted);
+}
+
 .issues .issue {
-  border: 1px solid #e2eaf6;
-  border-radius: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
   padding: 0.62rem;
   margin-bottom: 0.58rem;
 }
@@ -185,15 +198,26 @@ button {
   gap: 0.6rem;
 }
 
+.issue header strong {
+  color: var(--ink);
+}
+
+.issue header span {
+  background: rgba(21, 29, 46, 0.04);
+  border-radius: 4px;
+  padding: 0.1rem 0.35rem;
+  font-size: 0.82rem;
+}
+
 .issue p {
   margin: 0.35rem 0 0;
 }
 
 .hint {
-  color: #4b6689;
+  color: var(--muted);
 }
 
 .error {
-  color: #b42318;
+  color: var(--danger);
 }
 </style>

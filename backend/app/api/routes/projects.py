@@ -1,11 +1,13 @@
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import backend_dir, get_db
 from app.models import Project
 from app.schemas import ProjectCreate, ProjectRead, ProjectUpdate
 
@@ -78,3 +80,35 @@ def delete_project(project_id: str, db: Session = Depends(get_db)) -> Response:
     db.delete(project)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{project_id}/images/{filepath:path}")
+def get_project_image(project_id: str, filepath: str) -> FileResponse:
+    """Serve generated images for a project (supports subdirectories)."""
+    # Prevent path traversal — block ".." components
+    if ".." in filepath.split("/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid filepath")
+
+    images_dir = backend_dir / "data" / "storage" / project_id / "images"
+    resolved = images_dir / filepath
+
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+
+    # Ensure the resolved path stays within images_dir (prevent traversal via symlinks)
+    try:
+        resolved.resolve().relative_to(images_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    suffix = resolved.suffix.lower()
+    media_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".svg": "image/svg+xml",
+    }
+    media_type = media_types.get(suffix, "application/octet-stream")
+    return FileResponse(resolved, media_type=media_type)

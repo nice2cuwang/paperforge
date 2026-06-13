@@ -27,6 +27,7 @@ def set_sqlite_pragma(dbapi_connection, connection_record):  # type: ignore[no-u
     del connection_record
     if database_url.startswith("sqlite"):
         cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA busy_timeout=30000")
         cursor.close()

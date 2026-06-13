@@ -160,7 +160,7 @@ def generate_draft(
                     "message": "Build evidence cards first, then generate draft.",
                 },
             )
-        content = build_draft_markdown(
+        content, _sections = build_draft_markdown(
             project_title=payload.title or project.title,
             research_question=project.research_question,
             article_type=project.article_type,

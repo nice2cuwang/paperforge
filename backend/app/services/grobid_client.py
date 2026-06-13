@@ -23,7 +23,7 @@ def _grobid_url(path: str) -> str:
 def is_available() -> bool:
     """Check if GROBID service is reachable."""
     try:
-        with create_httpx_client(timeout=5.0) as client:
+        with create_httpx_client(timeout=3.0) as client:
             resp = client.get(_grobid_url("/api/isalive"))
             return resp.status_code == 200 and "true" in resp.text.lower()
     except Exception:
@@ -35,16 +35,23 @@ def parse_pdf(pdf_path: Path) -> tuple[str, dict[str, Any]]:
 
     Raises on failure so caller can fall back to PyMuPDF.
     """
+    from app.middleware.metrics import metrics_inc_tagged
+
     url = _grobid_url("/api/processFulltextDocument")
-    with create_httpx_client(timeout=_GROBID_TIMEOUT) as client:
-        with open(pdf_path, "rb") as f:
-            files = {"input": (pdf_path.name, f, "application/pdf")}
-            data = {"consolidateHeader": "0", "includeRawCitations": "1", "includeRawAffiliations": "0"}
-            resp = client.post(url, data=data, files=files)
-        resp.raise_for_status()
-        tei_text = resp.text
-        meta = _extract_metadata(tei_text)
-        return tei_text, meta
+    try:
+        with create_httpx_client(timeout=_GROBID_TIMEOUT) as client:
+            with open(pdf_path, "rb") as f:
+                files = {"input": (pdf_path.name, f, "application/pdf")}
+                data = {"consolidateHeader": "0", "includeRawCitations": "1", "includeRawAffiliations": "0"}
+                resp = client.post(url, data=data, files=files)
+            resp.raise_for_status()
+            tei_text = resp.text
+            meta = _extract_metadata(tei_text)
+            metrics_inc_tagged("paperforge_grobid_api_calls", "ok")
+            return tei_text, meta
+    except Exception:
+        metrics_inc_tagged("paperforge_grobid_api_calls", "err")
+        raise
 
 
 def _ns(tag: str) -> str:

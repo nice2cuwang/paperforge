@@ -25,6 +25,10 @@ class EvidenceCard(Base):
     claim: Mapped[str] = mapped_column(Text, nullable=False)
     supporting_text: Mapped[str] = mapped_column(Text, nullable=False)
     evidence_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    source_type: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True, default=None, index=True,
+        comment="academic | web | community | llm_knowledge"
+    )
     strength: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     limitations: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     page_start: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

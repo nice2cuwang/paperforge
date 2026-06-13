@@ -130,10 +130,12 @@ onMounted(async () => {
 .page {
   display: grid;
   gap: 1rem;
+  max-width: 1200px;
 }
 
 .head h1 {
   margin: 0;
+  font-family: var(--font-display);
 }
 
 .head p {
@@ -143,11 +145,12 @@ onMounted(async () => {
 
 .toolbar {
   border: 1px solid var(--line);
-  border-radius: 14px;
-  background: #fff;
+  border-radius: var(--radius-md);
+  background: var(--surface);
   padding: 0.8rem;
   display: flex;
   gap: 0.6rem;
+  box-shadow: var(--shadow-sm);
 }
 
 .editor {
@@ -159,8 +162,8 @@ onMounted(async () => {
 .versions,
 .editor-main {
   border: 1px solid var(--line);
-  border-radius: 14px;
-  background: #fff;
+  border-radius: var(--radius-md);
+  background: var(--surface);
   padding: 0.8rem;
 }
 
@@ -172,14 +175,16 @@ onMounted(async () => {
 
 .version-item {
   text-align: left;
-  border: 1px solid #c9d8ed;
-  background: #f7fbff;
-  color: #194774;
+  border: 1px solid var(--line-soft);
+  background: var(--surface-strong);
+  color: var(--ink);
+  border-radius: var(--radius-sm);
 }
 
 .version-item.active {
-  border-color: #0b6bce;
-  background: #e8f2ff;
+  border-color: var(--accent);
+  background: var(--accent-light);
+  color: var(--accent-strong);
 }
 
 .editor-tabs {
@@ -204,18 +209,19 @@ onMounted(async () => {
   color: #3a4c67;
   font-size: 0.86rem;
   padding: 0.4rem 0.65rem;
+  border-radius: var(--radius-sm);
 }
 
 .tabs button.active {
-  background: #0b6dd6;
+  background: var(--accent);
   color: #fff;
 }
 
 .md-preview {
   min-height: 360px;
   padding: 0.8rem;
-  border-radius: 12px;
-  border: 1px solid #bfd0e5;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line-soft);
   background: #fff;
   line-height: 1.75;
   color: #1f2937;
@@ -228,7 +234,7 @@ onMounted(async () => {
 .md-preview :deep(p) { margin: 0.45rem 0; }
 .md-preview :deep(ul), .md-preview :deep(ol) { margin: 0.45rem 0; padding-left: 1.4rem; }
 .md-preview :deep(li) { margin: 0.15rem 0; }
-.md-preview :deep(blockquote) { margin: 0.45rem 0; padding-left: 0.7rem; border-left: 3px solid #0b6dd6; color: #4b5563; }
+.md-preview :deep(blockquote) { margin: 0.45rem 0; padding-left: 0.7rem; border-left: 3px solid var(--accent); color: #4b5563; }
 .md-preview :deep(pre) { background: #f6f8fb; padding: 0.6rem; border-radius: 8px; overflow-x: auto; }
 .md-preview :deep(code) { background: #f0f2f6; padding: 0.12rem 0.25rem; border-radius: 4px; font-size: 0.88em; }
 .md-preview :deep(a) { color: #0b6dd6; }
@@ -239,28 +245,28 @@ onMounted(async () => {
 textarea {
   width: 100%;
   border: 1px solid #bfd0e5;
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   padding: 0.7rem;
-  font: 400 0.94rem/1.5 "JetBrains Mono", "Consolas", monospace;
+  font: 400 0.94rem/1.5 var(--font-mono);
   resize: vertical;
 }
 
 button {
   border: 0;
-  border-radius: 10px;
-  background: #0b6dd6;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
   color: #fff;
   padding: 0.52rem 0.8rem;
   cursor: pointer;
 }
 
 button.ghost {
-  background: #deecfb;
-  color: #1f416a;
+  background: var(--accent-light);
+  color: var(--accent-strong);
 }
 
 .error {
-  color: #b42318;
+  color: var(--danger);
 }
 
 @media (max-width: 980px) {

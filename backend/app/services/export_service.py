@@ -7,9 +7,9 @@ from typing import Any, Iterable
 
 
 def ensure_export_dir(base_dir: Path, project_id: str) -> Path:
-    target = base_dir / "exports" / project_id
-    target.mkdir(parents=True, exist_ok=True)
-    return target
+    from app.services.storage import get_storage_backend
+    path_str = get_storage_backend().ensure_export_dir(project_id)
+    return Path(path_str) if not path_str.startswith("s3://") else Path(path_str)
 
 
 def export_markdown(target_dir: Path, filename: str, content_md: str) -> Path:
@@ -67,27 +67,24 @@ def export_pdf(target_dir: Path, filename: str, content_md: str) -> Path:
 
 
 def export_bibtex(target_dir: Path, filename: str, papers: Iterable[dict]) -> Path:
-    entries: list[str] = []
-    for idx, paper in enumerate(papers, start=1):
-        authors = paper.get("authors") or []
-        author_text = " and ".join(str(item) for item in authors if item)
-        key_source = paper.get("doi") or paper.get("arxiv_id") or f"paper{idx}"
-        key = str(key_source).replace("/", "_").replace(":", "_")
-        entries.append(
-            "\n".join(
-                [
-                    f"@article{{{key},",
-                    f"  title = {{{paper.get('title') or 'Untitled'}}},",
-                    f"  author = {{{author_text or 'Unknown'}}},",
-                    f"  year = {{{paper.get('year') or ''}}},",
-                    f"  journal = {{{paper.get('venue') or ''}}},",
-                    f"  doi = {{{paper.get('doi') or ''}}},",
-                    "}",
-                ]
-            )
-        )
+    from app.services.citation_service import format_bibliography
+
+    class _FakePaper:
+        def __init__(self, data: dict) -> None:
+            self.id = data.get("id", "")
+            self.title = data.get("title") or "Untitled"
+            self.authors = data.get("authors") or []
+            self.year = data.get("year")
+            self.venue = data.get("venue") or ""
+            self.doi = data.get("doi") or ""
+            self.arxiv_id = data.get("arxiv_id") or ""
+            self.source_url = data.get("source_url") or ""
+            self.pdf_url = data.get("pdf_url") or ""
+
+    fake_papers = [_FakePaper(p) for p in papers]
+    text = format_bibliography(fake_papers, style="bibtex")
     path = target_dir / filename
-    path.write_text("\n\n".join(entries) + "\n", encoding="utf-8")
+    path.write_text(text + "\n", encoding="utf-8")
     return path
 
 

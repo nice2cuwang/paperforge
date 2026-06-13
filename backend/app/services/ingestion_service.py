@@ -22,27 +22,15 @@ ALLOWED_SYMBOLS = set(
 
 
 def save_uploaded_pdf(base_dir: Path, project_id: str, paper_id: str, filename: str, content: bytes) -> Path:
-    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", filename or "upload.pdf")
-    if not safe_name.lower().endswith(".pdf"):
-        safe_name += ".pdf"
-    target_dir = base_dir / "storage" / project_id / "pdf"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / f"{paper_id}_{safe_name}"
-    target.write_bytes(content)
-    return target
+    from app.services.storage import get_storage_backend
+    path_str = get_storage_backend().save_pdf(project_id, paper_id, filename, content)
+    return Path(path_str) if not path_str.startswith("s3://") else Path(path_str)
 
 
 def save_tei_placeholder(base_dir: Path, project_id: str, paper_id: str, text: str) -> Path:
-    target_dir = base_dir / "storage" / project_id / "tei"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / f"{paper_id}.tei.xml"
-    target.write_text(
-        "<TEI><text><body>"
-        + "".join(f"<p>{escape_xml(line)}</p>" for line in text.splitlines() if line.strip())
-        + "</body></text></TEI>",
-        encoding="utf-8",
-    )
-    return target
+    from app.services.storage import get_storage_backend
+    path_str = get_storage_backend().save_tei(project_id, paper_id, text)
+    return Path(path_str) if not path_str.startswith("s3://") else Path(path_str)
 
 
 def escape_xml(value: str) -> str:
@@ -58,7 +46,10 @@ def escape_xml(value: str) -> str:
 def extract_pdf_text(pdf_path: Path) -> str:
     # 1) Try GROBID first for structured TEI extraction.
     try:
-        from app.services.grobid_client import parse_pdf, tei_to_plaintext
+        from app.services.grobid_client import is_available, parse_pdf, tei_to_plaintext
+
+        if not is_available():
+            raise RuntimeError("GROBID not reachable, fall back to pypdf/PyMuPDF")
 
         tei_text, _meta = parse_pdf(pdf_path)
         plain = tei_to_plaintext(tei_text)

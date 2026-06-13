@@ -59,6 +59,7 @@ def _record_to_dict(task: TaskRecord) -> dict[str, Any]:
         "result": task.result,
         "created_at": _dt_to_str(task.created_at),
         "updated_at": _dt_to_str(task.updated_at),
+        "started_at": _dt_to_str(task.started_at),
     }
 
 
@@ -72,6 +73,7 @@ def _dict_to_record(data: dict[str, Any]) -> TaskRecord:
         result=data.get("result", {}),
         created_at=_str_to_dt(data["created_at"]),
         updated_at=_str_to_dt(data["updated_at"]),
+        started_at=_str_to_dt(data.get("started_at", data["created_at"])),
     )
 
 
@@ -131,6 +133,7 @@ class TaskRecord:
     result: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 _task_store: dict[str, TaskRecord] = _load()
@@ -168,6 +171,11 @@ def create_task(step: str) -> TaskRecord:
     with _task_lock:
         _task_store[task.task_id] = task
         _save()
+    try:
+        from app.middleware.metrics import metrics_inc
+        metrics_inc("paperforge_tasks_created")
+    except Exception:
+        pass
     return task
 
 
@@ -232,7 +240,21 @@ def complete_task(task_id: str, result: dict[str, Any] | None = None) -> None:
             task.result = result
         task.logs.append("completed")
         _touch(task)
+        duration_seconds = (task.updated_at - task.started_at).total_seconds()
         _save()
+    try:
+        from app.middleware.metrics import metrics_inc, metrics_observe
+        metrics_inc("paperforge_tasks_completed")
+        metrics_observe("paperforge_task_duration_seconds", duration_seconds)
+        if result and isinstance(result, dict):
+            if result.get("evidence_count", 0) > 0:
+                metrics_inc("paperforge_evidence_cards_generated", result["evidence_count"])
+            if "publication_prepared" in result:
+                metrics_inc("paperforge_publication_gate_total")
+                if result["publication_prepared"]:
+                    metrics_inc("paperforge_publication_gate_passed")
+    except Exception:
+        pass
 
 
 def fail_task(task_id: str, reason: str, result: dict[str, Any] | None = None) -> None:
@@ -247,6 +269,11 @@ def fail_task(task_id: str, reason: str, result: dict[str, Any] | None = None) -
         task.logs.append(f"failed: {reason}")
         _touch(task)
         _save()
+    try:
+        from app.middleware.metrics import metrics_inc
+        metrics_inc("paperforge_tasks_failed")
+    except Exception:
+        pass
 
 
 def get_task(task_id: str) -> dict[str, Any] | None:
@@ -261,3 +288,12 @@ def get_task(task_id: str) -> dict[str, Any] | None:
         data["created_at"] = task.created_at.isoformat()
         data["expired"] = _is_expired(task)
         return data
+
+
+def list_tasks(limit: int = 20) -> list[dict[str, Any]]:
+    with _task_lock:
+        cleanup_expired_tasks()
+        sorted_tasks = sorted(
+            _task_store.values(), key=lambda t: t.created_at, reverse=True
+        )
+        return [get_task(t.task_id) for t in sorted_tasks[:limit] if get_task(t.task_id) is not None]

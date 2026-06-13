@@ -1,16 +1,54 @@
+/* ═══════════════════════════════════════════════════════
+   PaperForge — Design Tokens & Base Styles
+   Academic Atelier aesthetic: warm neutrals + teal accent
+   ═══════════════════════════════════════════════════════ */
+
 :root {
-  --bg: #f7f7f2;
-  --surface: #fffef9;
+  /* Core palette */
+  --bg: #f4f3ee;
+  --surface: #fffef8;
   --surface-strong: #ffffff;
-  --ink: #111423;
-  --muted: #56607c;
-  --line: #d9dfeb;
-  --accent: #0f7f78;
-  --accent-strong: #0b5e59;
-  --signal: #b97117;
+  --surface-raised: #fffdf5;
+  --ink: #151d2e;
+  --ink-soft: #2a3550;
+  --muted: #627191;
+  --muted-soft: #8b96ad;
+  --line: #d4dbe8;
+  --line-soft: #e4e9f1;
+
+  /* Accent */
+  --accent: #0d7c75;
+  --accent-strong: #09625c;
+  --accent-light: #e0f5f0;
+  --accent-muted: #b8ded6;
+
+  /* Signals */
+  --signal: #b5791f;
+  --signal-light: #fef3e0;
   --danger: #b42318;
+  --danger-light: #fef0ee;
+  --success: #1a7a4c;
+  --success-light: #e6f7ed;
+  --info: #1a65c4;
+  --info-light: #e8f0fe;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 3px rgba(21, 29, 46, 0.04), 0 1px 2px rgba(21, 29, 46, 0.03);
+  --shadow-md: 0 4px 14px rgba(21, 29, 46, 0.06), 0 2px 6px rgba(21, 29, 46, 0.03);
+  --shadow-lg: 0 12px 36px rgba(21, 29, 46, 0.08), 0 4px 12px rgba(21, 29, 46, 0.04);
+
+  /* Radii */
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+
+  /* Fonts */
+  --font-body: "IBM Plex Sans", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  --font-display: "Space Grotesk", "Noto Sans SC", sans-serif;
+  --font-mono: "JetBrains Mono", "Consolas", monospace;
+
   color: var(--ink);
-  font: 400 15px/1.6 "IBM Plex Sans", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  font: 400 15px/1.65 var(--font-body);
 }
 
 *,
@@ -28,9 +66,9 @@ body,
 
 body {
   background:
-    radial-gradient(1200px 700px at -10% -30%, #d9f1ea 0%, transparent 50%),
-    radial-gradient(900px 560px at 110% 0%, #f7e8cc 0%, transparent 50%),
-    linear-gradient(180deg, #f6f7f3 0%, #f3f6f9 35%, #f7f7f2 100%);
+    radial-gradient(ellipse 1200px 700px at -8% -25%, rgba(196, 237, 228, 0.35) 0%, transparent 55%),
+    radial-gradient(ellipse 900px 560px at 108% -5%, rgba(245, 224, 181, 0.3) 0%, transparent 55%),
+    linear-gradient(175deg, #f3f4f0 0%, #f1f3f6 40%, #f4f3ee 100%);
   color: var(--ink);
 }
 
@@ -39,19 +77,101 @@ body::before {
   position: fixed;
   inset: 0;
   pointer-events: none;
-  background-image: linear-gradient(rgba(21, 31, 44, 0.02) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(21, 31, 44, 0.02) 1px, transparent 1px);
-  background-size: 24px 24px;
-  mask-image: radial-gradient(circle at 50% 30%, #000 0%, transparent 75%);
+  background-image:
+    linear-gradient(rgba(21, 29, 46, 0.015) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(21, 29, 46, 0.015) 1px, transparent 1px);
+  background-size: 28px 28px;
+  mask-image: radial-gradient(circle at 50% 30%, #000 0%, transparent 72%);
+  z-index: 0;
 }
+
+/* ── Animations ─────────────────────────────────────── */
 
 @keyframes rise-in {
   from {
     opacity: 0;
-    transform: translateY(14px);
+    transform: translateY(12px);
   }
   to {
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slide-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Scrollbar ──────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(21, 29, 46, 0.12);
+  border-radius: 99px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(21, 29, 46, 0.22);
+}
+
+/* ── Selection ──────────────────────────────────────── */
+
+::selection {
+  background: rgba(13, 124, 117, 0.15);
+  color: var(--ink);
+}
+
+/* ── Focus ──────────────────────────────────────────── */
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ── Typography ─────────────────────────────────────── */
+
+h1, h2, h3, h4, h5 {
+  font-family: var(--font-display);
+  color: var(--ink);
+}
+
+a {
+  color: var(--accent);
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  background: rgba(21, 29, 46, 0.05);
+  padding: 0.12em 0.3em;
+  border-radius: 4px;
 }

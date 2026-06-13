@@ -17,7 +17,9 @@ from app.api import (
     tasks_router,
     workflow_router,
 )
+from app.api.routes.dashboard import router as dashboard_router
 from app.database import Base, engine
+from app.middleware import MetricsMiddleware, RequestLoggingMiddleware
 
 
 @asynccontextmanager
@@ -44,6 +46,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(MetricsMiddleware)
+
 app.include_router(projects_router)
 app.include_router(papers_router)
 app.include_router(chunks_router)
@@ -54,6 +59,7 @@ app.include_router(workflow_router)
 app.include_router(exports_router)
 app.include_router(tasks_router)
 app.include_router(llm_router)
+app.include_router(dashboard_router)
 
 
 @app.get("/health", response_class=PlainTextResponse)

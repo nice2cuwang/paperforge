@@ -263,12 +263,14 @@ onMounted(loadPapers);
 
 <style scoped>
 .page {
+  max-width: 1100px;
   display: grid;
   gap: 1rem;
 }
 
 .head h1 {
   margin: 0;
+  font-family: var(--font-display);
 }
 
 .head p {
@@ -278,8 +280,9 @@ onMounted(loadPapers);
 
 .card {
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: #fff;
+  box-shadow: var(--shadow-sm);
   padding: 0.9rem;
 }
 
@@ -288,6 +291,7 @@ onMounted(loadPapers);
   flex-wrap: wrap;
   gap: 0.7rem;
   align-items: flex-end;
+  background: linear-gradient(135deg, var(--surface) 0%, var(--surface) 100%);
 }
 
 label {
@@ -296,27 +300,35 @@ label {
 }
 
 input {
-  border: 1px solid #bfd0e5;
-  border-radius: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
   padding: 0.5rem 0.68rem;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-light);
 }
 
 button {
   border: 0;
-  border-radius: 10px;
-  background: #0a6bd4;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
   color: white;
   padding: 0.5rem 0.75rem;
   cursor: pointer;
+  transition: background 0.2s, opacity 0.2s;
 }
 
 button.ghost {
-  background: #dceafb;
-  color: #1c3f69;
+  background: var(--accent-light);
+  color: var(--accent-strong);
 }
 
 button.danger {
-  background: #b42318;
+  background: var(--danger);
 }
 
 button:disabled {
@@ -331,14 +343,19 @@ table {
 
 th,
 td {
-  border-bottom: 1px solid #e2eaf6;
+  border-bottom: 1px solid var(--line-soft);
   text-align: left;
   vertical-align: top;
   padding: 0.55rem;
 }
 
+th {
+  color: var(--muted);
+  font-weight: 500;
+}
+
 .meta {
-  color: #587193;
+  color: var(--muted-soft);
   font-size: 0.88rem;
   margin-top: 0.25rem;
 }
@@ -349,7 +366,7 @@ td {
 }
 
 .error {
-  color: #b42318;
+  color: var(--danger);
 }
 
 @media (max-width: 900px) {

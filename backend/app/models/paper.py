@@ -27,6 +27,10 @@ class Paper(Base):
     venue: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     abstract: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     source: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    source_type: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True, default=None, index=True,
+        comment="academic | web | community | llm_knowledge"
+    )
     source_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     pdf_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     oa_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)

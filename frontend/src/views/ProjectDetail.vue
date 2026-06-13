@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
@@ -30,13 +30,13 @@ const busy = ref(false);
 const workflowHint = ref("");
 
 const workflowStages = [
-  { threshold: 5, label: "检索论文", desc: "拉取候选并去重" },
-  { threshold: 30, label: "下载与解析", desc: "下载或复用 PDF 并切块" },
-  { threshold: 66, label: "构建证据", desc: "生成可追溯证据卡" },
-  { threshold: 78, label: "生成草稿", desc: "基于证据自动写作" },
-  { threshold: 86, label: "审查草稿", desc: "识别引用与逻辑问题" },
-  { threshold: 93, label: "自动修订", desc: "生成修订稿" },
-  { threshold: 97, label: "导出文件", desc: "导出 markdown/docx/pdf/bib" }
+  { threshold: 5, label: "检索", desc: "拉取候选论文并去重" },
+  { threshold: 30, label: "解析", desc: "下载/复用 PDF 并切块" },
+  { threshold: 66, label: "证据", desc: "生成可追溯证据卡" },
+  { threshold: 78, label: "草稿", desc: "基于证据自动写作" },
+  { threshold: 86, label: "审查", desc: "多智能体辩论审查" },
+  { threshold: 93, label: "修订", desc: "生成修订稿" },
+  { threshold: 97, label: "导出", desc: "markdown/docx/pdf/bib" }
 ];
 
 const currentStageIndex = computed(() => {
@@ -236,89 +236,140 @@ onMounted(async () => {
 
 <template>
   <section v-if="project" class="page">
-    <header class="hero card">
-      <div>
+    <!-- ── Hero ── -->
+    <header class="hero">
+      <div class="hero-content">
+        <button class="back-link" type="button" @click="router.push('/')">
+          <span>&larr;</span> 项目列表
+        </button>
         <h1>{{ project.title }}</h1>
-        <p>{{ project.research_question }}</p>
+        <p class="rq">{{ project.research_question }}</p>
+        <div class="hero-tags">
+          <span class="tag">{{ project.article_type }}</span>
+          <span class="tag">{{ project.language }}</span>
+          <span class="tag">~{{ project.target_words.toLocaleString() }} 字</span>
+          <span v-if="project.citation_style" class="tag">{{ project.citation_style }}</span>
+        </div>
+        <RouterLink :to="`/projects/${projectId}/chat`" class="chat-entry-btn">
+          进入对话模式
+        </RouterLink>
       </div>
-      <button class="ghost" type="button" @click="router.push('/')">返回项目列表</button>
     </header>
 
-    <section class="stats">
-      <article class="stat card">
+    <!-- ── Stats ── -->
+    <div class="stats-row">
+      <div class="stat-chip">
         <strong>{{ papers.length }}</strong>
-        <span>论文候选</span>
-      </article>
-      <article class="stat card">
+        <span>论文</span>
+      </div>
+      <div class="stat-chip">
         <strong>{{ evidence.length }}</strong>
         <span>证据卡</span>
-      </article>
-      <article class="stat card">
+      </div>
+      <div class="stat-chip">
         <strong>{{ drafts.length }}</strong>
-        <span>草稿版本</span>
-      </article>
-      <article class="stat card">
+        <span>草稿</span>
+      </div>
+      <div class="stat-chip">
         <strong>{{ issues.length }}</strong>
         <span>审查问题</span>
-      </article>
-    </section>
-
-    <section class="control card">
-      <h2>自动工作流控制台</h2>
-      <div class="buttons">
-        <button class="primary" :disabled="busy" type="button" @click="runAutoWorkflow">一键全自动</button>
-        <button :disabled="busy" type="button" @click="quickSearch">检索论文</button>
-        <button :disabled="busy" type="button" @click="quickBuildEvidence">构建证据</button>
-        <button :disabled="busy" type="button" @click="quickGenerateDraft">生成草稿</button>
-        <button :disabled="busy || drafts.length === 0" type="button" @click="quickReview">审查草稿</button>
-        <button :disabled="busy || drafts.length === 0" type="button" @click="quickRevise">生成修订</button>
       </div>
-    </section>
+    </div>
 
-    <section class="workflow card">
-      <div class="head">
-        <h2>流程可视化</h2>
-        <span>{{ workflowHint || "点击一键全自动后，系统会实时显示阶段与日志。" }}</span>
+    <!-- ── Pipeline Visualization ── -->
+    <section class="card pipeline-card">
+      <div class="pipeline-header">
+        <h2>工作流</h2>
+        <span v-if="workflowHint" class="pipeline-hint">{{ workflowHint }}</span>
+        <span v-else class="pipeline-hint">点击下方按钮启动流程</span>
       </div>
-      <ol class="stage-list">
-        <li
+
+      <div class="pipeline">
+        <div
           v-for="(stage, idx) in workflowStages"
           :key="stage.label"
+          class="pipe-node"
           :class="{
             done: idx < currentStageIndex,
             active: idx === currentStageIndex
           }"
         >
-          <b>{{ idx + 1 }}. {{ stage.label }}</b>
-          <small>{{ stage.desc }}</small>
-        </li>
-      </ol>
+          <div class="pipe-dot" />
+          <div class="pipe-content">
+            <strong>{{ stage.label }}</strong>
+            <small>{{ stage.desc }}</small>
+          </div>
+        </div>
+      </div>
     </section>
 
+    <!-- ── Actions ── -->
+    <section class="card actions-card">
+      <h2>操作</h2>
+      <div class="action-grid">
+        <button class="primary-action" :disabled="busy" type="button" @click="runAutoWorkflow">
+          一键全自动
+        </button>
+        <div class="step-actions">
+          <button :disabled="busy" type="button" @click="quickSearch">检索论文</button>
+          <button :disabled="busy" type="button" @click="quickBuildEvidence">构建证据</button>
+          <button :disabled="busy" type="button" @click="quickGenerateDraft">生成草稿</button>
+          <button :disabled="busy || drafts.length === 0" type="button" @click="quickReview">审查草稿</button>
+          <button :disabled="busy || drafts.length === 0" type="button" @click="quickRevise">生成修订</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Task Progress ── -->
     <TaskProgress :task="task" />
 
-    <section v-if="autoWorkflow" class="result card">
+    <!-- ── Auto Workflow Result ── -->
+    <section v-if="autoWorkflow" class="card result-card">
       <h2>本次自动执行结果</h2>
-      <p>
-        已选 {{ autoWorkflow.selected_count }} 篇（自动纳入 {{ autoWorkflow.auto_selected_count }}），复用本地
-        {{ autoWorkflow.reused_local_pdf_count }}，二次回退命中 {{ autoWorkflow.resolved_via_fallback_count }}，下载
-        {{ autoWorkflow.downloaded_count }}，解析 {{ autoWorkflow.parsed_count }}，无 PDF 跳过
-        {{ autoWorkflow.skipped_no_pdf_count }}。
+
+      <div class="result-grid">
+        <div class="result-item">
+          <span class="result-label">已选论文</span>
+          <strong>{{ autoWorkflow.selected_count }}</strong>
+          <small>（自动 {{ autoWorkflow.auto_selected_count }}）</small>
+        </div>
+        <div class="result-item">
+          <span class="result-label">复用本地</span>
+          <strong>{{ autoWorkflow.reused_local_pdf_count }}</strong>
+        </div>
+        <div class="result-item">
+          <span class="result-label">下载</span>
+          <strong>{{ autoWorkflow.downloaded_count }}</strong>
+        </div>
+        <div class="result-item">
+          <span class="result-label">解析</span>
+          <strong>{{ autoWorkflow.parsed_count }}</strong>
+        </div>
+        <div class="result-item">
+          <span class="result-label">证据卡</span>
+          <strong>{{ autoWorkflow.evidence_count }}</strong>
+        </div>
+        <div class="result-item">
+          <span class="result-label">审查问题</span>
+          <strong>{{ autoWorkflow.review_issue_count }}</strong>
+          <small>（critical {{ autoWorkflow.critical_issue_count }}）</small>
+        </div>
+      </div>
+
+      <div class="result-status" :class="autoWorkflow.publication_prepared ? 'pass' : 'warn'">
+        <strong>{{ autoWorkflow.publication_prepared ? "已达终稿门禁" : "未达终稿门禁" }}</strong>
+      </div>
+
+      <p v-if="Object.keys(autoWorkflow.export_files).length > 0" class="export-hint">
+        导出文件已写入 backend/data/exports/
       </p>
-      <p>
-        证据卡 {{ autoWorkflow.evidence_count }}，审查问题 {{ autoWorkflow.review_issue_count }}（critical
-        {{ autoWorkflow.critical_issue_count }}）。
-      </p>
-      <p class="hint">
-        publication_prepared: {{ autoWorkflow.publication_prepared ? "true" : "false" }}
-      </p>
-      <p v-if="Object.keys(autoWorkflow.export_files).length > 0" class="hint">
-        导出文件已写入 `backend/data/exports/{{ projectId }}`
-      </p>
-      <button type="button" class="ghost" @click="router.push(`/projects/${projectId}/final`)">前端查看终稿</button>
+
+      <button type="button" class="ghost-btn" @click="router.push(`/projects/${projectId}/final`)">
+        查看终稿 &rarr;
+      </button>
     </section>
 
-    <p v-if="error" class="error">{{ error }}</p>
+    <p v-if="error" class="error-toast">{{ error }}</p>
   </section>
 </template>
 
@@ -326,171 +377,421 @@ onMounted(async () => {
 .page {
   display: grid;
   gap: 1rem;
+  max-width: 1100px;
 }
 
-.card {
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  background: var(--surface);
-  padding: 1rem;
-  animation: rise-in 260ms ease;
-}
-
+/* ── Hero ── */
 .hero {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 1rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
   background:
-    radial-gradient(260px 130px at 95% -10%, rgba(245, 214, 158, 0.55) 0%, transparent 70%),
+    radial-gradient(240px 120px at 95% -5%, rgba(240, 210, 150, 0.35) 0%, transparent 70%),
     var(--surface);
+  padding: 1.3rem;
+  animation: rise-in 280ms cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: var(--shadow-sm);
+}
+
+.back-link {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.86rem;
+  padding: 0;
+  margin-bottom: 0.6rem;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  transition: color 160ms ease;
+}
+
+.back-link:hover {
+  color: var(--accent);
 }
 
 .hero h1 {
   margin: 0;
-  font: 700 1.82rem/1.2 "Space Grotesk", "Noto Sans SC", sans-serif;
+  font: 700 1.7rem/1.2 var(--font-display);
+  letter-spacing: 0.01em;
 }
 
-.hero p {
-  margin: 0.56rem 0 0;
-  color: #3a4c67;
+.rq {
+  margin: 0.5rem 0 0;
+  color: var(--muted);
+  line-height: 1.55;
 }
 
-.stats {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 0.7rem;
-}
-
-.stat {
-  background: var(--surface-strong);
-  display: grid;
-  gap: 0.2rem;
-  padding: 0.86rem;
-}
-
-.stat strong {
-  font-size: 1.46rem;
-}
-
-.stat span {
-  color: #576583;
-}
-
-.control {
-  display: grid;
-  gap: 0.7rem;
-}
-
-.control h2,
-.workflow h2,
-.result h2 {
-  margin: 0;
-  font-size: 1.04rem;
-}
-
-.buttons {
+.hero-tags {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.56rem;
+  gap: 0.4rem;
+  margin-top: 0.7rem;
 }
 
-button {
+.tag {
+  font-size: 0.76rem;
+  color: var(--muted);
+  background: rgba(21, 29, 46, 0.04);
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  padding: 0.15rem 0.5rem;
+}
+
+.chat-entry-btn {
+  display: inline-block;
+  margin-top: 0.8rem;
+  padding: 0.55rem 1.2rem;
   border: 0;
-  border-radius: 11px;
-  background: #e4edf8;
-  color: #173656;
-  padding: 0.5rem 0.76rem;
-  cursor: pointer;
-}
-
-button.primary {
+  border-radius: var(--radius-sm);
+  background: linear-gradient(135deg, var(--accent) 0%, #a06a18 100%);
   color: #fff;
-  background: linear-gradient(90deg, #0f7f78 0%, #c07817 100%);
+  font-weight: 600;
+  font-size: 0.92rem;
+  text-decoration: none;
+  cursor: pointer;
+  transition: transform 160ms ease, box-shadow 160ms ease;
 }
 
-button.ghost {
-  color: #1f4568;
-  background: #deecff;
+.chat-entry-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(13, 124, 117, 0.25);
 }
 
-button:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-
-.workflow {
+/* ── Stats ── */
+.stats-row {
   display: grid;
-  gap: 0.7rem;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.65rem;
+}
+
+.stat-chip {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-strong);
+  padding: 0.75rem 0.85rem;
+  display: grid;
+  gap: 2px;
+  box-shadow: var(--shadow-sm);
+  animation: rise-in 300ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.stat-chip strong {
+  font: 700 1.5rem/1 var(--font-display);
+  color: var(--ink);
+}
+
+.stat-chip span {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+/* ── Card base ── */
+.card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  padding: 1.1rem;
+  animation: rise-in 300ms cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: var(--shadow-sm);
+}
+
+/* ── Pipeline ── */
+.pipeline-card {
   background:
-    radial-gradient(240px 120px at 0% 0%, rgba(201, 233, 230, 0.62) 0%, transparent 70%),
+    radial-gradient(200px 100px at 0% 0%, rgba(195, 230, 222, 0.4) 0%, transparent 70%),
     var(--surface);
 }
 
-.head {
-  display: grid;
-  gap: 0.2rem;
+.pipeline-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.9rem;
 }
 
-.head span {
-  color: #506079;
-  font-size: 0.92rem;
-}
-
-.stage-list {
+.pipeline-header h2 {
   margin: 0;
-  padding: 0;
-  list-style: none;
+  font-size: 1rem;
+}
+
+.pipeline-hint {
+  font-size: 0.84rem;
+  color: var(--muted-soft);
+}
+
+.pipeline {
+  display: flex;
+  gap: 0;
+  overflow-x: auto;
+  padding-bottom: 0.3rem;
+}
+
+.pipe-node {
+  flex: 1;
+  min-width: 90px;
   display: grid;
-  gap: 0.45rem;
+  grid-template-rows: auto auto;
+  gap: 0.4rem;
+  align-items: center;
+  justify-items: center;
+  position: relative;
+  padding: 0.6rem 0.3rem;
+  border-radius: var(--radius-sm);
+  transition: all 200ms ease;
 }
 
-.stage-list li {
-  border: 1px solid #d9dfeb;
-  border-radius: 12px;
-  padding: 0.5rem 0.62rem;
+.pipe-node::after {
+  content: "";
+  position: absolute;
+  top: 18px;
+  left: calc(50% + 12px);
+  right: calc(-50% + 12px);
+  height: 2px;
+  background: var(--line);
+  transition: background 200ms ease;
+}
+
+.pipe-node:last-child::after {
+  display: none;
+}
+
+.pipe-dot {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--line-soft);
+  border: 2px solid var(--line);
+  transition: all 200ms ease;
+  z-index: 1;
+}
+
+.pipe-content {
+  text-align: center;
   display: grid;
+  gap: 1px;
 }
 
-.stage-list b {
-  font-size: 0.93rem;
+.pipe-content strong {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--muted);
 }
 
-.stage-list small {
-  color: #55637e;
+.pipe-content small {
+  font-size: 0.7rem;
+  color: var(--muted-soft);
 }
 
-.stage-list li.done {
-  border-color: rgba(19, 121, 99, 0.42);
-  background: #ebf8f1;
+.pipe-node.done .pipe-dot {
+  background: var(--accent);
+  border-color: var(--accent);
 }
 
-.stage-list li.active {
-  border-color: rgba(195, 129, 28, 0.45);
-  background: #fff2de;
+.pipe-node.done .pipe-content strong {
+  color: var(--accent-strong);
 }
 
-.result p {
-  margin: 0.42rem 0;
+.pipe-node.done::after {
+  background: var(--accent-muted);
 }
 
-.hint {
-  color: #3b526f;
+.pipe-node.active .pipe-dot {
+  background: var(--signal);
+  border-color: var(--signal);
+  box-shadow: 0 0 0 4px rgba(181, 121, 31, 0.15);
+  animation: pulse-soft 2s ease-in-out infinite;
 }
 
-.error {
+.pipe-node.active .pipe-content strong {
+  color: var(--signal);
+}
+
+.pipe-node.active {
+  background: rgba(181, 121, 31, 0.04);
+}
+
+/* ── Actions ── */
+.actions-card {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.actions-card h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.action-grid {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.primary-action {
+  border: 0;
+  border-radius: var(--radius-sm);
+  padding: 0.65rem 1rem;
+  color: #fff;
+  font-weight: 600;
+  font-size: 0.95rem;
+  background: linear-gradient(135deg, var(--accent) 0%, #a06a18 100%);
+  cursor: pointer;
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+
+.primary-action:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(13, 124, 117, 0.25);
+}
+
+.step-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.step-actions button {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-strong);
+  color: var(--ink-soft);
+  padding: 0.45rem 0.72rem;
+  cursor: pointer;
+  font-size: 0.86rem;
+  transition: all 160ms ease;
+}
+
+.step-actions button:hover:not(:disabled) {
+  border-color: var(--accent-muted);
+  background: var(--accent-light);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── Result ── */
+.result-card {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.result-card h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.result-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 0.55rem;
+}
+
+.result-item {
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  padding: 0.55rem 0.7rem;
+  background: var(--surface-strong);
+  display: grid;
+  gap: 2px;
+}
+
+.result-label {
+  font-size: 0.76rem;
+  color: var(--muted-soft);
+}
+
+.result-item strong {
+  font-size: 1.1rem;
+  font-family: var(--font-display);
+}
+
+.result-item small {
+  font-size: 0.76rem;
+  color: var(--muted);
+}
+
+.result-status {
+  border: 1px solid;
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.7rem;
+}
+
+.result-status.pass {
+  border-color: rgba(26, 122, 76, 0.35);
+  background: var(--success-light);
+  color: var(--success);
+}
+
+.result-status.warn {
+  border-color: rgba(181, 121, 31, 0.35);
+  background: var(--signal-light);
+  color: var(--signal);
+}
+
+.export-hint {
+  margin: 0;
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+
+.ghost-btn {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-strong);
+  color: var(--accent);
+  padding: 0.5rem 0.8rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: all 160ms ease;
+}
+
+.ghost-btn:hover {
+  border-color: var(--accent-muted);
+  background: var(--accent-light);
+}
+
+.error-toast {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  padding: 0.7rem 1.1rem;
+  border-radius: var(--radius-md);
+  background: var(--danger-light);
   color: var(--danger);
+  border: 1px solid rgba(180, 35, 24, 0.2);
+  font-size: 0.9rem;
+  z-index: 200;
+  animation: rise-in 200ms ease;
 }
 
 @media (max-width: 950px) {
-  .stats {
+  .stats-row {
     grid-template-columns: repeat(2, 1fr);
+  }
+
+  .pipeline {
+    flex-wrap: wrap;
+    gap: 0.3rem;
+  }
+
+  .pipe-node {
+    min-width: 80px;
+  }
+
+  .pipe-node::after {
+    display: none;
   }
 }
 
 @media (max-width: 640px) {
-  .stats {
-    grid-template-columns: 1fr;
+  .stats-row {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .step-actions {
+    flex-direction: column;
   }
 }
 </style>

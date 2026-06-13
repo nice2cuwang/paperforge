@@ -10,11 +10,17 @@ from urllib.parse import quote, urlparse
 from fastapi import HTTPException, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import backend_dir
 from app.models import Paper, PaperChunk
 from app.services.http_client import create_httpx_client
 from app.services.ingestion_service import chunk_text, extract_pdf_text, save_tei_placeholder, save_uploaded_pdf
+from app.services.figure_extraction_service import (
+    extract_figures_from_pdf,
+    render_key_pages,
+    _detect_table_pages,
+)
 from app.services import embedding_service, qdrant_service
 from app.services.workflow.helpers import (
     _now,
@@ -22,6 +28,8 @@ from app.services.workflow.helpers import (
     _extract_doi_from_text,
     _extract_pdf_from_openalex_work,
     _normalize_doi,
+    _resolve_local_pdf_path,
+    _resolve_pdf_url,
 )
 from app.services.task_registry import add_log
 
@@ -266,55 +274,6 @@ def _resolve_pdf_url_with_fallback(
     return None, trace
 
 
-def _resolve_pdf_url(paper: Paper) -> str | None:
-    if paper.pdf_url:
-        return paper.pdf_url
-    if paper.arxiv_id:
-        return f"https://arxiv.org/pdf/{paper.arxiv_id}.pdf"
-    if paper.source_url and "arxiv.org/abs/" in paper.source_url:
-        return paper.source_url.replace("/abs/", "/pdf/") + ".pdf"
-    return None
-
-
-def _resolve_local_pdf_path(local_pdf_path: str | None) -> Path | None:
-    if not local_pdf_path:
-        return None
-    raw = local_pdf_path.strip()
-    if not raw:
-        return None
-
-    candidates: list[Path] = []
-    direct = Path(raw)
-    candidates.append(direct)
-
-    normalized = raw.replace("\\", "/")
-    if normalized.startswith("/app/data/"):
-        suffix = normalized[len("/app/data/") :]
-        candidates.append(backend_dir / "data" / suffix)
-
-    marker = "/data/"
-    if marker in normalized:
-        suffix = normalized.split(marker, 1)[1]
-        candidates.append(backend_dir / "data" / suffix)
-
-    for candidate in candidates:
-        if candidate.exists() and candidate.is_file():
-            return candidate.resolve()
-    return None
-
-
-def _paper_has_download_potential(paper: Paper) -> bool:
-    if _resolve_local_pdf_path(paper.local_pdf_path):
-        return True
-    if _resolve_pdf_url(paper):
-        return True
-    if paper.doi or _extract_doi_from_text(paper.source_url):
-        return True
-    if paper.arxiv_id or _extract_arxiv_id(paper.source_url):
-        return True
-    return False
-
-
 def _provider_diagnostics() -> dict[str, str]:
     checks = {
         "openalex": "https://api.openalex.org/works?per-page=1",
@@ -435,6 +394,11 @@ def _download_pdf_for_paper(
             continue
 
     if content is None:
+        try:
+            from app.middleware.metrics import metrics_inc_tagged
+            metrics_inc_tagged("paperforge_pdf_download_calls", "err")
+        except Exception:
+            pass
         raise HTTPException(
             status_code=400,
             detail={
@@ -476,6 +440,11 @@ def _download_pdf_for_paper(
     paper.local_pdf_path = str(saved)
     paper.parse_status = "pending"
     paper.updated_at = _now()
+    try:
+        from app.middleware.metrics import metrics_inc_tagged
+        metrics_inc_tagged("paperforge_pdf_download_calls", "ok")
+    except Exception:
+        pass
     return str(saved)
 
 
@@ -514,6 +483,11 @@ def _parse_paper_to_chunks(paper: Paper, db: Session, chunk_size: int) -> int:
         paper.local_tei_path = str(tei_path)
         paper.parse_status = "failed"
         paper.updated_at = _now()
+        try:
+            from app.middleware.metrics import metrics_inc_tagged
+            metrics_inc_tagged("paperforge_parse_calls", "err")
+        except Exception:
+            pass
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
@@ -570,7 +544,54 @@ def _parse_paper_to_chunks(paper: Paper, db: Session, chunk_size: int) -> int:
     except Exception as exc:
         logger.warning("Qdrant upsert failed for paper %s: %s (proceeding without vectors)", paper.id, exc)
 
+    # ── Extract figures from PDF ─────────────────────────────────
+    try:
+        figures_dir = backend_dir / "data" / "storage" / paper.project_id / "images" / "figures"
+        extracted_figures = extract_figures_from_pdf(
+            pdf_path=pdf_path,
+            output_dir=figures_dir,
+            paper_id=paper.id,
+            project_id=paper.project_id,
+        )
+
+        # Also render the first page (title/overview) and detected table pages
+        pages_to_render = [1]  # always render first page
+        table_pages = _detect_table_pages(pdf_path)
+        for tp in table_pages:
+            if tp not in pages_to_render:
+                pages_to_render.append(tp)
+
+        page_renders = render_key_pages(
+            pdf_path=pdf_path,
+            output_dir=figures_dir,
+            paper_id=paper.id,
+            project_id=paper.project_id,
+            pages=pages_to_render,
+        )
+        extracted_figures.extend(page_renders)
+
+        if extracted_figures:
+            # Merge into existing metadata_json — use a fresh dict copy
+            # and flag_modified to ensure SQLAlchemy detects the JSON change
+            new_meta = dict(paper.metadata_json or {})
+            new_meta["extracted_figures"] = extracted_figures
+            paper.metadata_json = new_meta
+            flag_modified(paper, "metadata_json")
+            logger.info(
+                "Extracted %d figures + %d page renders for paper %s",
+                len(extracted_figures) - len(page_renders),
+                len(page_renders),
+                paper.id,
+            )
+    except Exception as exc:
+        logger.warning("Figure extraction failed for paper %s: %s (non-fatal)", paper.id, exc)
+
     paper.local_tei_path = str(tei_path)
     paper.parse_status = "parsed"
     paper.updated_at = _now()
+    try:
+        from app.middleware.metrics import metrics_inc_tagged
+        metrics_inc_tagged("paperforge_parse_calls", "ok")
+    except Exception:
+        pass
     return len(chunks)

@@ -99,23 +99,25 @@ const summaryEntries = computed(() => {
 <style scoped>
 .task {
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: var(--radius-md);
   padding: 0.9rem;
   background: var(--surface-strong);
+  box-shadow: var(--shadow-sm);
   display: grid;
   gap: 0.56rem;
 }
 
 .task.running {
-  box-shadow: 0 8px 26px rgba(17, 76, 103, 0.1);
+  box-shadow: var(--shadow-md);
+  border-color: var(--accent);
 }
 
 .task.done {
-  border-color: rgba(20, 124, 95, 0.35);
+  border-color: rgba(26, 122, 76, 0.35);
 }
 
 .task.failed {
-  border-color: rgba(180, 35, 24, 0.4);
+  border-color: rgba(180, 35, 24, 0.35);
 }
 
 .head {
@@ -125,7 +127,7 @@ const summaryEntries = computed(() => {
 }
 
 .id {
-  font-family: "Space Grotesk", "Noto Sans SC", sans-serif;
+  font-family: var(--font-display);
   font-weight: 600;
 }
 
@@ -133,8 +135,8 @@ const summaryEntries = computed(() => {
   border-radius: 999px;
   font-size: 0.82rem;
   padding: 0.16rem 0.58rem;
-  color: #17344c;
-  background: #dff4ef;
+  color: var(--accent-strong);
+  background: var(--accent-light);
 }
 
 .task.failed .state {
@@ -149,19 +151,19 @@ const summaryEntries = computed(() => {
 
 .step {
   margin: 0;
-  color: #35506b;
+  color: var(--ink-soft);
 }
 
 .bar {
   height: 9px;
   overflow: hidden;
   border-radius: 999px;
-  background: #e3e7ef;
+  background: var(--line-soft);
 }
 
 .fill {
   height: 100%;
-  background: linear-gradient(90deg, #0f7f78 0%, #db9b39 100%);
+  background: linear-gradient(90deg, var(--accent) 0%, #c08a1f 100%);
 }
 
 .percent {
@@ -172,14 +174,14 @@ const summaryEntries = computed(() => {
 .logs {
   margin: 0;
   padding-left: 1rem;
-  color: #465672;
+  color: var(--muted);
   font-size: 0.88rem;
 }
 
 .failure-panel {
-  border: 1px solid rgba(180, 35, 24, 0.28);
+  border: 1px solid rgba(180, 35, 24, 0.2);
   border-radius: 12px;
-  background: #fff4f2;
+  background: var(--danger-light);
   padding: 0.7rem 0.8rem;
   display: grid;
   gap: 0.4rem;

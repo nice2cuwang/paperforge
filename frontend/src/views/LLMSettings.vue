@@ -483,7 +483,8 @@ onMounted(() => {
 
 .card {
   border: 1px solid var(--line, #d9dfeb);
-  border-radius: 18px;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
   background: var(--surface, #fff);
   padding: 1.2rem;
   animation: rise-in 260ms ease;
@@ -502,12 +503,12 @@ onMounted(() => {
 
 .hero h1 {
   margin: 0;
-  font: 700 1.82rem/1.2 "Space Grotesk", "Noto Sans SC", sans-serif;
+  font: 700 1.82rem/1.2 var(--font-display), "Noto Sans SC", sans-serif;
 }
 
 .hero p {
   margin: 0.56rem 0 0;
-  color: #3a4c67;
+  color: var(--muted);
 }
 
 button {
@@ -530,12 +531,12 @@ button:disabled {
 
 button.primary {
   color: #fff;
-  background: linear-gradient(90deg, #0f7f78 0%, #c07817 100%);
+  background: linear-gradient(135deg, var(--accent) 0%, #a06a18 100%);
 }
 
 button.secondary {
-  color: #1f4568;
-  background: #deecff;
+  color: var(--accent-strong);
+  background: var(--accent-light);
 }
 
 .provider-grid {
@@ -547,17 +548,18 @@ button.secondary {
 .provider-card {
   display: grid;
   gap: 0.7rem;
+  box-shadow: var(--shadow-sm);
   transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
 }
 
 .provider-card:hover {
   transform: translateY(-2px);
-  box-shadow: 0 8px 24px rgba(15, 39, 61, 0.08);
+  box-shadow: var(--shadow-md);
 }
 
 .provider-card.active {
-  border-color: rgba(19, 121, 99, 0.55);
-  background: linear-gradient(180deg, #f6fdf9 0%, #fff 100%);
+  border-color: rgba(13, 124, 117, 0.45);
+  background: linear-gradient(180deg, #f4fcf9 0%, #fff 100%);
 }
 
 .card-header {
@@ -575,8 +577,8 @@ button.secondary {
 }
 
 .status-dot.on {
-  background: #22c55e;
-  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.2);
+  background: var(--success);
+  box-shadow: 0 0 0 3px rgba(26, 122, 76, 0.2);
 }
 
 .card-header h3 {
@@ -587,8 +589,8 @@ button.secondary {
 
 .provider-tag {
   font-size: 0.72rem;
-  color: #576583;
-  background: #eef2f8;
+  color: var(--muted);
+  background: rgba(21,29,46,0.04);
   padding: 0.15rem 0.5rem;
   border-radius: 6px;
 }
@@ -630,18 +632,18 @@ button.secondary {
 }
 
 .latency-good {
-  background: #dcfce7;
-  color: #166534;
+  background: var(--success-light);
+  color: var(--success);
 }
 
 .latency-mid {
-  background: #fef9c3;
-  color: #854d0e;
+  background: var(--signal-light);
+  color: var(--signal);
 }
 
 .latency-bad {
-  background: #fee2e2;
-  color: #991b1b;
+  background: var(--danger-light);
+  color: var(--danger);
 }
 
 .test-error {
@@ -658,24 +660,24 @@ button.secondary {
 
 .activate-btn {
   color: #fff;
-  background: linear-gradient(90deg, #0f7f78 0%, #c07817 100%);
+  background: linear-gradient(135deg, var(--accent) 0%, #a06a18 100%);
 }
 
 .activated-label {
   font-size: 0.82rem;
-  color: #15803d;
+  color: var(--success);
   font-weight: 500;
   padding: 0.4rem 0.6rem;
 }
 
 .ghost-btn {
-  color: #1f4568;
-  background: #deecff;
+  color: var(--accent-strong);
+  background: var(--accent-light);
 }
 
 .danger-btn {
-  color: #991b1b;
-  background: #fee2e2;
+  color: var(--danger);
+  background: var(--danger-light);
 }
 
 .empty-state {
@@ -724,14 +726,14 @@ button.secondary {
 }
 
 .toast.success {
-  background: #dcfce7;
-  color: #166534;
+  background: var(--success-light);
+  color: var(--success);
   border: 1px solid #bbf7d0;
 }
 
 .toast.error {
-  background: #fee2e2;
-  color: #991b1b;
+  background: var(--danger-light);
+  color: var(--danger);
   border: 1px solid #fecaca;
 }
 
@@ -739,7 +741,7 @@ button.secondary {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 37, 0.45);
+  background: rgba(15, 23, 37, 0.4);
   backdrop-filter: blur(4px);
   display: grid;
   place-items: center;
@@ -749,7 +751,7 @@ button.secondary {
 
 .modal {
   background: #fff;
-  border-radius: 18px;
+  border-radius: var(--radius-lg);
   width: min(640px, 92vw);
   max-height: 88vh;
   overflow: auto;
@@ -800,7 +802,7 @@ button.secondary {
 
 .back-link {
   background: transparent;
-  color: #0f7f78;
+  color: var(--accent);
   padding: 0;
   font-size: 0.88rem;
   text-align: left;
@@ -817,7 +819,7 @@ button.secondary {
   gap: 0.35rem;
   text-align: left;
   border: 1px solid #d9dfeb;
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   padding: 0.9rem;
   background: #f7f9fc;
   cursor: pointer;
@@ -826,13 +828,13 @@ button.secondary {
 
 .preset-card:hover {
   transform: translateY(-2px);
-  border-color: rgba(19, 121, 99, 0.35);
+  border-color: var(--accent-muted);
 }
 
 .preset-icon {
   width: 28px;
   height: 28px;
-  color: #0f7f78;
+  color: var(--accent);
 }
 
 .preset-icon :deep(svg) {
@@ -859,7 +861,7 @@ button.secondary {
 .field label {
   font-size: 0.88rem;
   font-weight: 500;
-  color: #1f2937;
+  color: var(--ink-soft);
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -874,7 +876,7 @@ button.secondary {
 .field label .value {
   margin-left: auto;
   font-variant-numeric: tabular-nums;
-  color: #0f7f78;
+  color: var(--accent);
 }
 
 .field input[type="text"],
@@ -894,13 +896,13 @@ button.secondary {
 .field input:focus,
 .field select:focus {
   outline: none;
-  border-color: #0f7f78;
-  box-shadow: 0 0 0 3px rgba(15, 127, 120, 0.12);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(13, 124, 117, 0.1);
 }
 
 .field input[type="range"] {
   width: 100%;
-  accent-color: #0f7f78;
+  accent-color: var(--accent);
 }
 
 .field-row {

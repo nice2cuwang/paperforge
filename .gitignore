@@ -1,66 +1,50 @@
-# ---------------------------------------------------------------------------
-# Environment & Secrets
-# ---------------------------------------------------------------------------
-.env
-.env.local
-.env.*.local
-*.pem
-*.key
-
-# ---------------------------------------------------------------------------
 # Python
-# ---------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
-*$py.class
+*.class
 *.so
-.Python
 *.egg-info/
 dist/
 build/
+*.egg
+.venv/
+venv/
+env/
 
-# ---------------------------------------------------------------------------
-# Node.js
-# ---------------------------------------------------------------------------
-frontend/node_modules/
-frontend/.npm-cache/
+# Backend data (DB, storage, exports, cached wheels)
+backend/data/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Node / Frontend
+node_modules/
 frontend/dist/
-frontend/*.tsbuildinfo
+frontend/.npm-cache/
+frontend/.vite/
 
-# ---------------------------------------------------------------------------
-# IDE / Editor
-# ---------------------------------------------------------------------------
+# Conda / pip cache
+.conda/
+.pip-cache/
+
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.DS_Store
-Thumbs.db
 
-# ---------------------------------------------------------------------------
-# Data & Runtime
-# ---------------------------------------------------------------------------
-backend/data/
-*.db
-*.db-journal
-*.db-wal
-*.db-shm
-*.sqlite
-*.sqlite3
+# OS
+Thumbs.db
+.DS_Store
+nul
+
+# Logs
 *.log
 
-# ---------------------------------------------------------------------------
-# Misc
-# ---------------------------------------------------------------------------
-.conda/
-.pip-cache/
-
-# Internal documentation
-PaperForge_Codex_*.md
-
-frontend/.vite/
-
-# Test & Merge artifacts
-backend/.pytest_cache/
-*.orig
+# Coverage
+htmlcov/
+.coverage
+coverage.xml

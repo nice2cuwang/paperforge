@@ -9,6 +9,7 @@ class EvidenceCardCreate(BaseModel):
     claim: str = Field(min_length=1)
     supporting_text: str = Field(min_length=1)
     evidence_type: str | None = Field(default=None, max_length=64)
+    source_type: str | None = Field(default=None, max_length=32)
     strength: str | None = Field(default=None, max_length=32)
     limitations: str | None = None
     page_start: int | None = Field(default=None, ge=1)
@@ -23,6 +24,7 @@ class EvidenceCardUpdate(BaseModel):
     claim: str | None = Field(default=None, min_length=1)
     supporting_text: str | None = Field(default=None, min_length=1)
     evidence_type: str | None = Field(default=None, max_length=64)
+    source_type: str | None = Field(default=None, max_length=32)
     strength: str | None = Field(default=None, max_length=32)
     limitations: str | None = None
     page_start: int | None = Field(default=None, ge=1)
@@ -41,6 +43,7 @@ class EvidenceCardRead(BaseModel):
     claim: str
     supporting_text: str
     evidence_type: str | None
+    source_type: str | None
     strength: str | None
     limitations: str | None
     page_start: int | None

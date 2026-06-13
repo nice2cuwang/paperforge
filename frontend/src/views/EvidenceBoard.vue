@@ -84,10 +84,12 @@ onMounted(load);
 .page {
   display: grid;
   gap: 1rem;
+  max-width: 1100px;
 }
 
 .head h1 {
   margin: 0;
+  font-family: var(--font-display);
 }
 
 .head p {
@@ -97,15 +99,16 @@ onMounted(load);
 
 .toolbar {
   border: 1px solid var(--line);
-  border-radius: 14px;
-  background: #fff;
+  border-radius: var(--radius-md);
+  background: var(--surface);
   padding: 0.8rem;
+  box-shadow: var(--shadow-sm);
 }
 
 button {
   border: 0;
-  border-radius: 10px;
-  background: #0d6ed7;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
   color: #fff;
   padding: 0.55rem 0.8rem;
   cursor: pointer;
@@ -118,11 +121,12 @@ button {
 
 .card {
   border: 1px solid var(--line);
-  border-radius: 12px;
-  background: #fff;
+  border-radius: var(--radius-md);
+  background: var(--surface-strong);
   padding: 0.8rem;
   display: grid;
   gap: 0.55rem;
+  box-shadow: var(--shadow-sm);
 }
 
 .card header {
@@ -131,14 +135,21 @@ button {
   gap: 0.8rem;
 }
 
+.card header strong {
+  color: var(--ink);
+}
+
 .card header span {
-  color: #3f5d84;
-  font-size: 0.88rem;
+  background: var(--accent-light);
+  color: var(--accent-strong);
+  border-radius: 6px;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.78rem;
 }
 
 .card p {
   margin: 0;
-  color: #213a59;
+  color: var(--ink-soft);
   line-height: 1.55;
 }
 
@@ -146,11 +157,11 @@ button {
   display: flex;
   flex-wrap: wrap;
   gap: 0.7rem;
-  color: #587193;
-  font-size: 0.86rem;
+  color: var(--muted-soft);
+  font-size: 0.82rem;
 }
 
 .error {
-  color: #b42318;
+  color: var(--danger);
 }
 </style>

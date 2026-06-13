@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.database import backend_dir
 from app.models import Draft, EvidenceCard, Paper, Project
 
 logger = logging.getLogger(__name__)
@@ -79,6 +81,7 @@ def _evidence_to_dict(card: EvidenceCard) -> dict:
         "claim": card.claim,
         "supporting_text": card.supporting_text,
         "evidence_type": card.evidence_type,
+        "source_type": card.source_type,
         "strength": card.strength,
         "limitations": card.limitations,
         "page_start": card.page_start,
@@ -150,3 +153,48 @@ def _extract_pdf_from_openalex_work(work: dict[str, Any]) -> str | None:
 
 def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def _resolve_pdf_url(paper: Paper) -> str | None:
+    if paper.pdf_url:
+        return paper.pdf_url
+    if paper.arxiv_id:
+        return f"https://arxiv.org/pdf/{paper.arxiv_id}.pdf"
+    if paper.source_url and "arxiv.org/abs/" in paper.source_url:
+        return paper.source_url.replace("/abs/", "/pdf/") + ".pdf"
+    return None
+
+
+def _resolve_local_pdf_path(local_pdf_path: str | None) -> Path | None:
+    if not local_pdf_path:
+        return None
+    raw = local_pdf_path.strip()
+    if not raw:
+        return None
+    candidates: list[Path] = []
+    direct = Path(raw)
+    candidates.append(direct)
+    normalized = raw.replace("\\", "/")
+    if normalized.startswith("/app/data/"):
+        suffix = normalized[len("/app/data/"):]
+        candidates.append(backend_dir / "data" / suffix)
+    marker = "/data/"
+    if marker in normalized:
+        suffix = normalized.split(marker, 1)[1]
+        candidates.append(backend_dir / "data" / suffix)
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def _paper_has_download_potential(paper: Paper) -> bool:
+    if _resolve_local_pdf_path(paper.local_pdf_path):
+        return True
+    if _resolve_pdf_url(paper):
+        return True
+    if paper.doi or _extract_doi_from_text(paper.source_url):
+        return True
+    if paper.arxiv_id or _extract_arxiv_id(paper.source_url):
+        return True
+    return False

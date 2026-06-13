@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -10,28 +10,89 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Paper
-from app.database import backend_dir
 from app.services.search_service import normalize_title, search_papers
 from app.services.task_registry import add_log, set_progress
+from app.services.workflow.helpers import (
+    _normalize_doi,
+    _paper_has_download_potential,
+    _resolve_local_pdf_path,
+    _resolve_pdf_url,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _normalize_doi(value: str | None) -> str | None:
-    if not value:
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    lowered = text.lower()
-    if lowered.startswith("https://doi.org/"):
-        text = text[len("https://doi.org/"):]
-    elif lowered.startswith("http://doi.org/"):
-        text = text[len("http://doi.org/"):]
-    elif lowered.startswith("doi:"):
-        text = text[4:]
-    text = text.strip()
-    return text or None
+# ── LLM Query Rewriting ─────────────────────────────────────────
+
+
+def _llm_rewrite_queries(
+    research_question: str, project_title: str,
+) -> tuple[list[str], list[str]]:
+    """Use LLM to rewrite the research question into multiple precise search queries.
+
+    Returns (queries, required_terms):
+      - queries: list of 3-5 specific search strings
+      - required_terms: list of product/brand names that MUST appear in paper text
+    """
+    from app.services.llm_service import chat_completion
+
+    system_prompt = (
+        "你是一位学术搜索专家。你的任务是将用户的研究问题拆解为多个精准的英文搜索查询，"
+        "以便在学术论文数据库（如 OpenAlex、arXiv）中检索到最相关的论文。\n"
+        "同时，请识别研究问题中的专有名词（产品名、模型名、人名、机构名等），"
+        "这些词必须出现在相关论文的标题或摘要中。"
+    )
+    user_prompt = (
+        f"研究主题：{project_title}\n"
+        f"研究问题：{research_question}\n\n"
+        f"请完成以下任务，以 JSON 格式输出：\n"
+        f'{{"queries": ["查询1", "查询2", "查询3", "查询4", "查询5"], "required_terms": ["专有名词1", "专有名词2"]}}\n\n'
+        f"要求：\n"
+        f"1. 生成 3-5 个英文搜索查询，每个查询聚焦不同角度（如技术架构、性能评测、成本对比、应用场景等）\n"
+        f"2. 每个查询应包含核心关键词和 1-2 个辅助词，长度不超过 8 个词\n"
+        f"3. required_terms 中放置专有名词（如 DeepSeek, GPT-4, Janus 等），这些词是判断论文相关性的必要条件\n"
+        f"4. 如果没有明确的专有名词，required_terms 可以为空列表\n"
+        f"5. 只输出 JSON，不要输出其他内容"
+    )
+
+    try:
+        result = chat_completion(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=512,
+            timeout=30.0,
+        )
+        text = result.get("content", "").strip()
+        if not text:
+            return [], []
+
+        # Extract JSON from response (may be wrapped in code fences)
+        if "```" in text:
+            import re
+            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+            if match:
+                text = match.group(1)
+
+        data = json.loads(text)
+        queries = [q.strip() for q in data.get("queries", []) if q.strip()]
+        required_terms = [t.strip() for t in data.get("required_terms", []) if t.strip()]
+        return queries[:5], required_terms
+
+    except Exception:
+        logger.exception("LLM query rewriting failed, falling back to original query")
+        return [], []
+
+
+def _paper_matches_required_terms(paper: Paper, required_terms: list[str]) -> bool:
+    """Check if a paper matches at least one required term (case-insensitive)."""
+    if not required_terms:
+        return True  # No required terms = no filter
+    hay = " ".join([
+        (paper.title or ""),
+        (paper.abstract or ""),
+        (paper.venue or ""),
+    ]).lower()
+    return any(term.lower() in hay for term in required_terms)
 
 
 def _query_tokens(text: str) -> set[str]:
@@ -145,49 +206,6 @@ def _paper_identity_keys(paper: Paper) -> set[str]:
     return keys
 
 
-def _resolve_local_pdf_path(local_pdf_path: str | None) -> Path | None:
-    if not local_pdf_path:
-        return None
-    raw = local_pdf_path.strip()
-    if not raw:
-        return None
-    candidates: list[Path] = []
-    direct = Path(raw)
-    candidates.append(direct)
-    normalized = raw.replace("\\", "/")
-    if normalized.startswith("/app/data/"):
-        suffix = normalized[len("/app/data/"):]
-        candidates.append(backend_dir / "data" / suffix)
-    marker = "/data/"
-    if marker in normalized:
-        suffix = normalized.split(marker, 1)[1]
-        candidates.append(backend_dir / "data" / suffix)
-    for candidate in candidates:
-        if candidate.exists() and candidate.is_file():
-            return candidate.resolve()
-    return None
-
-
-def _resolve_pdf_url(paper: Paper) -> str | None:
-    if paper.pdf_url:
-        return paper.pdf_url
-    if paper.arxiv_id:
-        return f"https://arxiv.org/pdf/{paper.arxiv_id}.pdf"
-    return None
-
-
-def _paper_has_download_potential(paper: Paper) -> bool:
-    if _resolve_local_pdf_path(paper.local_pdf_path):
-        return True
-    if _resolve_pdf_url(paper):
-        return True
-    if paper.doi:
-        return True
-    if paper.arxiv_id:
-        return True
-    return False
-
-
 def _upsert_search_candidates(project_id: str, query: str, candidates: list, db: Session) -> int:
     existing = list(db.scalars(select(Paper).where(Paper.project_id == project_id)).all())
     existing_doi = {item.doi.lower().strip() for item in existing if item.doi}
@@ -242,16 +260,39 @@ def run_search_and_select(
     max_results: int,
     db: Session,
     task_id: str,
-) -> tuple[list[Paper], int, bool]:
+    project_title: str = "",
+) -> tuple[list[Paper], int, bool, list[str], list[str]]:
     """Run paper search and auto-selection for the workflow.
 
     Returns (selected_papers, inserted_count, reselection_triggered).
     """
     set_progress(task_id, 5, "searching papers")
+
+    # ── Step 1: LLM query rewriting ──────────────────────────────
+    title_for_rewrite = project_title or query
+    rewritten_queries, required_terms = _llm_rewrite_queries(query, title_for_rewrite)
+    if required_terms:
+        add_log(task_id, f"required terms extracted: {required_terms}")
+    if rewritten_queries:
+        add_log(task_id, f"LLM rewritten queries: {rewritten_queries}")
+
+    # ── Step 2: Multi-query search ───────────────────────────────
+    # Always search with the original query first
     candidates = search_papers(query=query, limit=max_results)
     inserted = _upsert_search_candidates(project_id=project_id, query=query, candidates=candidates, db=db)
     db.flush()
-    add_log(task_id, f"search done: candidates={len(candidates)}, inserted={inserted}")
+    add_log(task_id, f"original search done: candidates={len(candidates)}, inserted={inserted}")
+
+    # Then search with each rewritten query (dedup via _upsert)
+    for rw_query in rewritten_queries:
+        try:
+            rw_candidates = search_papers(query=rw_query, limit=max(6, max_results // len(rewritten_queries)))
+            rw_inserted = _upsert_search_candidates(project_id=project_id, query=rw_query, candidates=rw_candidates, db=db)
+            db.flush()
+            if rw_inserted > 0:
+                add_log(task_id, f"rewritten query '{rw_query[:50]}': +{rw_inserted} new candidates")
+        except Exception:
+            logger.debug("Rewritten query '%s' failed (non-fatal)", rw_query[:50], exc_info=True)
 
     papers = list(db.scalars(select(Paper).where(Paper.project_id == project_id)).all())
     selected_papers = [item for item in papers if item.selected]
@@ -349,6 +390,20 @@ def run_search_and_select(
         ]
         max_query_score = max((score for score, _, _ in scored_pool), default=0.0)
 
+        # ── Required terms boosting: papers matching required terms get a large score boost ──
+        if required_terms:
+            boosted_pool: list[tuple[float, float, Paper]] = []
+            for score, facet, paper in scored_pool:
+                term_match = _paper_matches_required_terms(paper, required_terms)
+                if term_match:
+                    boosted_score = score + 0.5  # Large boost for matching required terms
+                    boosted_pool.append((boosted_score, facet, paper))
+                else:
+                    # Penalize papers that don't match any required term
+                    boosted_pool.append((score * 0.3, facet, paper))
+            scored_pool = boosted_pool
+            add_log(task_id, f"required terms boosting applied: {required_terms}")
+
         if len(required_facets) >= 2:
             strict = [item for score, facet, item in scored_pool if score >= 0.18 and facet >= 0.67]
             if strict:
@@ -364,6 +419,7 @@ def run_search_and_select(
         ranked = sorted(
             scoped_pool,
             key=lambda item: (
+                1 if (required_terms and _paper_matches_required_terms(item, required_terms)) else 0,
                 _paper_query_score(item, query),
                 _paper_facet_coverage(item, query),
                 float(item.relevance_score or 0.0),
@@ -393,4 +449,4 @@ def run_search_and_select(
     else:
         add_log(task_id, f"using manually selected papers: {len(selected_papers)}")
 
-    return selected_papers, inserted, reselection_triggered
+    return selected_papers, inserted, reselection_triggered, rewritten_queries, required_terms
