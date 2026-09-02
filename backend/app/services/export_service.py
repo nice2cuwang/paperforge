@@ -1,9 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+logger = logging.getLogger(__name__)
+
+# Standalone image line: ![alt](url) - the format produced by finalize_figures.
+_IMAGE_LINE_RE = re.compile(r"^!\[([^\]]*)\]\(([^)\s]+)\)\s*$")
+# Inline images anywhere in the text (markdown export path rewriting).
+_INLINE_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
+# **bold** emphasis segments (figure captions like **图1：** ...).
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 
 
 def ensure_export_dir(base_dir: Path, project_id: str) -> Path:
@@ -12,27 +24,106 @@ def ensure_export_dir(base_dir: Path, project_id: str) -> Path:
     return Path(path_str) if not path_str.startswith("s3://") else Path(path_str)
 
 
+def _resolve_image_file(url: str) -> Path | None:
+    """Map an in-content image URL to a file on disk.
+
+    Workflow figures carry API paths (``/api/projects/{pid}/images/...``)
+    which live under ``backend/data/storage``. Unresolvable URLs return None
+    so callers can fall back to writing the original text.
+    """
+    if not url:
+        return None
+    if url.startswith("/api/projects/"):
+        from app.database import backend_dir
+
+        rel = url[len("/api/projects/"):].split("?", 1)[0]
+        candidate = backend_dir / "data" / "storage" / rel
+        return candidate if candidate.exists() else None
+    local = Path(url)
+    return local if local.exists() else None
+
+
 def export_markdown(target_dir: Path, filename: str, content_md: str) -> Path:
+    """Write markdown and bundle referenced images next to it.
+
+    Body images point at runtime API URLs (``/api/projects/...``) which break
+    the moment the backend is offline. Export copies each image into
+    ``images/`` and rewrites the markdown to relative paths so the export is
+    self-contained and shareable.
+    """
+    images_dir = target_dir / "images"
+    used_names: set[str] = set()
+
+    def _rewrite(match: re.Match[str]) -> str:
+        alt, url = match.group(1), match.group(2)
+        src = _resolve_image_file(url)
+        if src is None:
+            logger.warning("export_markdown: image not found on disk, left as-is: %s", url)
+            return match.group(0)
+        images_dir.mkdir(parents=True, exist_ok=True)
+        dest_name = src.name
+        counter = 1
+        while dest_name in used_names:
+            dest_name = f"{src.stem}-{counter}{src.suffix}"
+            counter += 1
+        used_names.add(dest_name)
+        shutil.copy2(src, images_dir / dest_name)
+        return f"![{alt}](images/{dest_name})"
+
     path = target_dir / filename
-    path.write_text(content_md, encoding="utf-8")
+    path.write_text(_INLINE_IMAGE_RE.sub(_rewrite, content_md), encoding="utf-8")
     return path
+
+
+def _add_docx_paragraph_with_emphasis(doc: Any, text: str) -> None:
+    """Add a paragraph rendering **bold** segments as bold runs."""
+    pos = 0
+    paragraph = None
+    for match in _BOLD_RE.finditer(text):
+        before = text[pos:match.start()]
+        if before and paragraph is None:
+            paragraph = doc.add_paragraph(before)
+        elif before and paragraph is not None:
+            paragraph.add_run(before)
+        if paragraph is None:
+            paragraph = doc.add_paragraph()
+        paragraph.add_run(match.group(1)).bold = True
+        pos = match.end()
+    if pos < len(text):
+        rest = text[pos:]
+        if paragraph is None:
+            doc.add_paragraph(rest)
+        else:
+            paragraph.add_run(rest)
 
 
 def export_docx(target_dir: Path, filename: str, content_md: str) -> Path:
     path = target_dir / filename
     try:
         from docx import Document  # type: ignore
+        from docx.shared import Inches  # type: ignore
 
         doc = Document()
-        for line in content_md.splitlines():
+        for raw_line in content_md.splitlines():
+            line = raw_line.strip()
+            image_match = _IMAGE_LINE_RE.match(line)
+            if image_match:
+                src = _resolve_image_file(image_match.group(2))
+                if src is not None:
+                    try:
+                        doc.add_picture(str(src), width=Inches(5.8))
+                        continue
+                    except Exception as exc:
+                        logger.warning("export_docx: failed to embed %s (%s), writing as text", src, exc)
+                # Unresolvable image: fall through and keep the markdown text.
             if line.startswith("# "):
                 doc.add_heading(line[2:].strip(), level=1)
             elif line.startswith("## "):
                 doc.add_heading(line[3:].strip(), level=2)
             elif line.startswith("### "):
                 doc.add_heading(line[4:].strip(), level=3)
-            elif line.strip():
-                doc.add_paragraph(line.strip())
+            elif line:
+                _add_docx_paragraph_with_emphasis(doc, line)
         doc.save(path)
         return path
     except Exception:
@@ -55,9 +146,23 @@ def export_pdf(target_dir: Path, filename: str, content_md: str) -> Path:
             pdf.set_font("SimHei", size=11)
         else:
             pdf.set_font("Helvetica", size=11)
-        for line in content_md.splitlines():
-            line = line.strip() or " "
-            pdf.multi_cell(0, 7, txt=line)
+        for raw_line in content_md.splitlines():
+            line = raw_line.strip() or " "
+            image_match = _IMAGE_LINE_RE.match(line)
+            if image_match:
+                src = _resolve_image_file(image_match.group(2))
+                if src is not None:
+                    try:
+                        pdf.ln(2)
+                        pdf.image(str(src), w=pdf.epw)
+                        pdf.ln(2)
+                        continue
+                    except Exception as exc:
+                        logger.warning("export_pdf: failed to embed %s (%s), writing as text", src, exc)
+            # fpdf renders no markdown: strip ** emphasis so captions like
+            # **图1：** do not show literal asterisks.
+            text = _BOLD_RE.sub(r"\1", line)
+            pdf.multi_cell(0, 7, txt=text)
         pdf.output(str(path))
         return path
     except Exception:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,42 @@ _COLORS = [
 ]
 
 
+_FONT_DIR = Path(__file__).resolve().parent.parent.parent / "fonts"
+_font_registered = False
+
+
+def _register_chinese_font() -> None:
+    """Register a CJK-capable font so Chinese labels render as glyphs, not boxes.
+
+    matplotlib has no built-in CJK font; without this, Chinese model/benchmark
+    names on every axis render as tofu squares. Reuses the same bundled
+    simhei.ttf as the PDF exporter and falls back gracefully when absent.
+    """
+    global _font_registered
+    if _font_registered:
+        return
+    _font_registered = True
+    try:
+        import matplotlib.font_manager as fm
+        import matplotlib.pyplot as plt
+
+        families: list[str] = []
+        for name in ("simhei.ttf", "msyh.ttc", "simsun.ttc"):
+            font_path = _FONT_DIR / name
+            if font_path.exists():
+                fm.fontManager.addfont(str(font_path))
+                families.append(fm.FontProperties(fname=str(font_path)).get_name())
+        if not families:
+            # No bundled font: try common system CJK families by name.
+            families = ["SimHei", "Microsoft YaHei", "Noto Sans CJK SC", "WenQuanYi Micro Hei"]
+        plt.rcParams["font.sans-serif"] = families + [
+            f for f in plt.rcParams.get("font.sans-serif", []) if isinstance(f, str)
+        ]
+        plt.rcParams["axes.unicode_minus"] = False
+    except Exception as exc:
+        logger.warning("CJK font registration failed (Chinese labels may render as boxes): %s", exc)
+
+
 def _ensure_matplotlib():
     """Import matplotlib with the non-interactive backend; raise if missing."""
     try:
@@ -43,6 +80,7 @@ def _ensure_matplotlib():
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt  # noqa: F401
 
+        _register_chinese_font()
         return True
     except ImportError:
         logger.warning(
@@ -98,7 +136,9 @@ def render_benchmark_comparison(
         scores = []
         for model in models:
             match = [d for d in data if d["model"] == model and d["benchmark"] == bm]
-            scores.append(match[0]["score"] if match else 0)
+            # Missing (model, benchmark) combos stay NaN: a NaN bar is simply
+            # not drawn. Zero-filling would falsely show "this model scored 0".
+            scores.append(float(match[0]["score"]) if match else float("nan"))
         offsets = [
             (i - len(benchmarks) / 2 + 0.5) * bar_height for _ in models
         ]
@@ -119,6 +159,183 @@ def render_benchmark_comparison(
     ax.invert_yaxis()
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return _to_api_path(output_path, project_id) if project_id else str(output_path.resolve())
+
+
+# F4: shape-detection helpers for chart-type selection.
+def _looks_like_time_series(benchmarks: list[dict[str, Any]]) -> bool:
+    """>=3 benchmarks whose names are years/periods (e.g. '2021' or '2021 版')."""
+    names = [str(b.get("benchmark", "")) for b in benchmarks]
+    time_points = [n for n in names if re.match(r"^\d{4}", n) or "年" in n]
+    return len(time_points) >= 3
+
+
+def _scatter_pair(benchmarks: list[dict[str, Any]]) -> tuple[str, str] | None:
+    """Exactly two models sharing >=4 benchmarks -> correlation scatter."""
+    models = sorted({b.get("model", "") for b in benchmarks if b.get("model")})
+    if len(models) != 2:
+        return None
+    shared = {
+        b.get("benchmark")
+        for b in benchmarks
+        if b.get("benchmark") and b.get("model") in models
+    }
+    return (models[0], models[1]) if len(shared) >= 4 else None
+
+
+def _radar_model(benchmarks: list[dict[str, Any]]) -> str | None:
+    """A model with >=4 distinct benchmarks -> multi-dim radar shape."""
+    by_model: dict[str, set[str]] = {}
+    for b in benchmarks:
+        model = b.get("model", "")
+        bm = b.get("benchmark", "")
+        if model and bm:
+            by_model.setdefault(model, set()).add(bm)
+    for model, dims in by_model.items():
+        if len(dims) >= 4:
+            return model
+    return None
+
+
+def render_time_series(
+    data: list[dict[str, Any]],
+    output_path: Path,
+    title: str = "Performance Trend",
+    *,
+    project_id: str = "",
+) -> str | None:
+    """Line chart: scores across time points (F4: 时序 -> 折线)."""
+    if not _ensure_matplotlib():
+        return None
+
+    import matplotlib.pyplot as plt
+
+    def _sort_key(name: str) -> tuple[int, str]:
+        m = re.match(r"^(\d{4})", name)
+        return (int(m.group(1)) if m else len(name), name)
+
+    time_points = sorted({d.get("benchmark", "") for d in data}, key=_sort_key)
+    models = sorted({d.get("model", "") for d in data if d.get("model")})
+    if not time_points or not models:
+        return None
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for m_idx, model in enumerate(models):
+        ys: list[float | None] = []
+        for tp in time_points:
+            match = [d for d in data if d.get("model") == model and d.get("benchmark") == tp]
+            ys.append(float(match[0]["score"]) if match else None)
+        ax.plot(
+            range(len(time_points)),
+            ys,
+            marker="o",
+            label=model,
+            color=_COLORS[m_idx % len(_COLORS)],
+            linewidth=2,
+        )
+    ax.set_xticks(range(len(time_points)))
+    ax.set_xticklabels(time_points, fontsize=9, rotation=20, ha="right")
+    ax.set_ylabel("Score", fontsize=10)
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=12)
+    ax.legend(fontsize=8, loc="best")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return _to_api_path(output_path, project_id) if project_id else str(output_path.resolve())
+
+
+def render_scatter_chart(
+    data: list[dict[str, Any]],
+    output_path: Path,
+    title: str = "Model Correlation",
+    *,
+    project_id: str = "",
+) -> str | None:
+    """Scatter: one model's scores vs another's per benchmark (F4: 相关性 -> 散点)."""
+    if not _ensure_matplotlib():
+        return None
+
+    import matplotlib.pyplot as plt
+
+    pair = _scatter_pair(data)
+    if not pair:
+        return None
+    model_a, model_b = pair
+    common: dict[str, tuple[float, float]] = {}
+    by_bm: dict[str, dict[str, float]] = {}
+    for d in data:
+        by_bm.setdefault(d.get("benchmark", ""), {})[d.get("model", "")] = float(d["score"])
+    for bm, scores in by_bm.items():
+        if model_a in scores and model_b in scores:
+            common[bm] = (scores[model_a], scores[model_b])
+    if len(common) < 4:
+        return None
+    xs = [v[0] for v in common.values()]
+    ys = [v[1] for v in common.values()]
+
+    fig, ax = plt.subplots(figsize=(6.5, 6))
+    ax.scatter(xs, ys, s=60, color=_COLORS[0], alpha=0.85)
+    for bm, (x, y) in common.items():
+        ax.annotate(str(bm), (x, y), fontsize=8, xytext=(4, 4), textcoords="offset points")
+    lims = [min(min(xs), min(ys)) * 0.9, max(max(xs), max(ys)) * 1.1]
+    ax.plot(lims, lims, ls="--", color="gray", lw=1)
+    ax.set_xlabel(model_a, fontsize=10)
+    ax.set_ylabel(model_b, fontsize=10)
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=12)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return _to_api_path(output_path, project_id) if project_id else str(output_path.resolve())
+
+
+def render_radar_chart(
+    data: list[dict[str, Any]],
+    output_path: Path,
+    title: str = "Multi-dim Comparison",
+    *,
+    project_id: str = "",
+) -> str | None:
+    """Radar: models as polygons across benchmark dimensions (F4: 多维 -> 雷达)."""
+    if not _ensure_matplotlib():
+        return None
+
+    import matplotlib.pyplot as plt
+
+    models = sorted({d.get("model", "") for d in data if d.get("model")})
+    dims = sorted({d.get("benchmark", "") for d in data if d.get("benchmark")})
+    if len(dims) < 3:
+        return None
+    by_model: dict[str, dict[str, float]] = {}
+    for d in data:
+        by_model.setdefault(d.get("model", ""), {})[d.get("benchmark", "")] = float(d["score"])
+    # Only models with all dims get plotted.
+    plotted = [m for m in models if all(bm in by_model[m] for bm in dims)]
+    if not plotted:
+        return None
+
+    angles = [i / len(dims) * 2 * 3.14159 for i in range(len(dims))] + [0.0]
+    fig, ax = plt.subplots(figsize=(7, 7), subplot_kw={"projection": "polar"})
+    for m_idx, model in enumerate(plotted):
+        values = [by_model[model][bm] for bm in dims] + [by_model[model][dims[0]]]
+        ax.plot(angles, values, marker="o", label=model, color=_COLORS[m_idx % len(_COLORS)], linewidth=2)
+        ax.fill(angles, values, color=_COLORS[m_idx % len(_COLORS)], alpha=0.12)
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(dims, fontsize=9)
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=20)
+    ax.legend(fontsize=8, loc="upper right", bbox_to_anchor=(1.15, 1.1))
     plt.tight_layout()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -351,7 +568,11 @@ def _extract_structured_data(
     system_prompt = (
         "You are a data extraction assistant. Extract structured quantitative "
         "benchmark/experimental data from the given evidence cards. Return ONLY "
-        "valid JSON, no markdown fences or commentary."
+        "valid JSON, no markdown fences or commentary.\n"
+        "F2 RULE: every number you output must appear VERBATIM in the evidence "
+        "cards. Do NOT estimate, interpolate, round, or fill in missing values -- "
+        "if a value is not stated, omit it. When the same metric is reported "
+        "differently in different cards, keep each reported value."
     )
     user_prompt = (
         f"Research topic: {project_title}\n\n"
@@ -395,6 +616,31 @@ def _extract_structured_data(
         return {"benchmarks": [], "paper_titles": [], "metrics_summary": {}}
 
 
+def matches_evidence_number(value: Any, evidence_text: str) -> bool:
+    """Deterministic F2 backstop: a charted number must appear in the evidence.
+
+    The extraction prompts demand verbatim numbers, but nothing enforced it --
+    an LLM-slipped hallucinated value went straight onto a chart. This checks
+    the value (and common formatting variants: trailing zeros, integer form)
+    occurs as a substring of the evidence corpus.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    text = evidence_text or ""
+    if not text:
+        return False
+    forms = {f"{number:g}"}
+    if number == int(number):
+        forms.add(str(int(number)))
+    else:
+        decimals = len(f"{number:g}".split(".", 1)[1])
+        for extra in range(decimals + 1, 4):
+            forms.add(f"{number:.{extra}f}")
+    return any(form in text for form in forms)
+
+
 def generate_charts_from_evidence(
     cards: list[Any],
     project_id: str,
@@ -422,14 +668,79 @@ def generate_charts_from_evidence(
         and b.get("benchmark")
         and isinstance(b.get("score"), (int, float))
     ]
+    # Deterministic F2 backstop: drop any entry whose score does not appear
+    # verbatim in the evidence corpus (the prompt rule alone let hallucinated
+    # numbers onto charts). Skipped when there is no evidence text at all -
+    # nothing to validate against.
+    evidence_corpus = " ".join(
+        f"{getattr(card, 'claim', '') or ''} {getattr(card, 'supporting_text', '') or ''}"
+        for card in cards
+    )
+    if evidence_corpus.strip():
+        verbatim_kept = [b for b in benchmarks if matches_evidence_number(b.get("score"), evidence_corpus)]
+        if len(verbatim_kept) < len(benchmarks):
+            logger.warning(
+                "chart data validation: dropped %d/%d benchmark entries whose score "
+                "does not appear verbatim in the evidence corpus",
+                len(benchmarks) - len(verbatim_kept), len(benchmarks),
+            )
+        benchmarks = verbatim_kept
     # Cap at 12 entries for readable charts.
     benchmarks = benchmarks[:12]
 
     paper_titles = structured.get("paper_titles", [])[:3]
     metrics_summary = structured.get("metrics_summary", {})
 
-    # ── Chart 1: benchmark comparison bar chart ──────────────────
-    if len(benchmarks) >= 3:
+    # ── Chart 1: shape-driven selection (F4) ────────────────────
+    # 时序 -> 折线；两模型共同基准 >=4 -> 相关性散点；单模型 >=4 维 -> 雷达；
+    # 其余多模型对比 -> 分组柱状。
+    time_series = _looks_like_time_series(benchmarks)
+    scatter_pair = _scatter_pair(benchmarks)
+    radar_model = _radar_model(benchmarks)
+
+    if time_series:
+        path = render_time_series(
+            benchmarks,
+            output_dir / "chart_trend.png",
+            title="Performance Trend",
+            project_id=project_id,
+        )
+        if path:
+            charts.append({
+                "path": path,
+                "alt": "Performance trend over time",
+                "section": "实验结果",
+                "source": "chart",
+            })
+    elif scatter_pair:
+        path = render_scatter_chart(
+            benchmarks,
+            output_dir / "chart_correlation.png",
+            title=f"{scatter_pair[0]} vs {scatter_pair[1]}",
+            project_id=project_id,
+        )
+        if path:
+            charts.append({
+                "path": path,
+                "alt": f"Correlation between {scatter_pair[0]} and {scatter_pair[1]}",
+                "section": "实验结果",
+                "source": "chart",
+            })
+    elif radar_model:
+        path = render_radar_chart(
+            benchmarks,
+            output_dir / "chart_radar.png",
+            title="Multi-dim Comparison",
+            project_id=project_id,
+        )
+        if path:
+            charts.append({
+                "path": path,
+                "alt": "Multi-dimension model comparison (radar)",
+                "section": "Results",
+                "source": "chart",
+            })
+    elif len(benchmarks) >= 3:
         unique_bm = set(b["benchmark"] for b in benchmarks)
         if len(unique_bm) > 1:
             groups: dict[str, list[dict]] = {}

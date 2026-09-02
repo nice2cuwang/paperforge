@@ -27,6 +27,169 @@ DEFAULT_HEIGHT = 576
 MAX_IMAGES_PER_ARTICLE = 5
 
 
+def _claim_tokens(text: str) -> set[str]:
+    """CJK bigram/trigram + alphanumeric tokens, for section<->evidence matching."""
+    t = (text or "").lower()
+    tokens = set(re.findall(r"[a-z0-9]{2,}", t))
+    cjk = [ch for ch in t if "一" <= ch <= "鿿"]
+    for idx in range(len(cjk) - 1):
+        tokens.add(cjk[idx] + cjk[idx + 1])
+    for idx in range(len(cjk) - 2):
+        tokens.add(cjk[idx] + cjk[idx + 1] + cjk[idx + 2])
+    return tokens
+
+
+def plan_figures(
+    sections: list[str],
+    evidence_cards: list[dict[str, Any]],
+    max_figures: int = 6,
+) -> list[dict[str, Any]]:
+    """Plan which figure each section needs, grounded in a real evidence card (F1).
+
+    Returns one plan per section (capped at ``max_figures``):
+    ``{"fig_index", "section", "kind", "evidence_id", "caption", "ref_key"}``.
+    The caption derives from the section's best-matching evidence card so
+    figures never decorate without data support; ``ref_key`` is what the
+    writing prompt asks the LLM to reference as ``{{ref:fig:N}}``.
+    """
+    plans: list[dict[str, Any]] = []
+    for i, section in enumerate(sections[:max_figures]):
+        sec_tokens = _claim_tokens(section)
+        best_card: dict[str, Any] | None = None
+        best_score = 0.0
+        for card in evidence_cards:
+            claim = (card.get("_clean_claim") or card.get("claim") or "")
+            claim_tokens = _claim_tokens(claim)
+            score = len(sec_tokens & claim_tokens)
+            if score > best_score:
+                best_card, best_score = card, score
+        claim = (best_card.get("_clean_claim") or best_card.get("claim") or "") if best_card else ""
+        kind = "chart" if re.search(r"[0-9%]", claim) else "illustration"
+        caption = re.sub(r"\s+", " ", claim).strip()[:60] or f"{section}概念示意"
+        plans.append(
+            {
+                "fig_index": i + 1,
+                "section": section,
+                "kind": kind,
+                "evidence_id": (best_card.get("id") or "") if best_card else "",
+                "caption": caption,
+                "ref_key": f"fig:{i + 1}",
+            }
+        )
+    return plans
+
+
+def finalize_figures(content_md: str, images: list[dict[str, str]]) -> str:
+    """F3: figure numbering + captions + cross-reference resolution.
+
+    1. Every ``![...](...)`` line gets a running number and a bold caption line
+       below it (``**图N：** caption``), preferring the plan-provided caption
+       and falling back to the image prompt/alt.
+    2. Every ``{{ref:fig:N}}`` placeholder the writer left in the body becomes
+       「（如图M所示）」 where M is the *actual* figure number the referenced
+       image received after injection -- not the plan index N. Extracted paper
+       figures and social cards occupy running numbers too, so the plan index
+       and the displayed number diverge whenever such images precede a planned
+       one. Mapping via each image's ``ref_key`` keeps the cross-reference
+       pointing at the right figure; when no image carries that ref_key (e.g.
+       images were not injected), N is used as-is so the reference still
+       resolves instead of leaving a raw placeholder behind.
+
+    Idempotent (L2): if a ``**图N：**`` caption already follows an image line,
+    the caption is replaced in place and its number kept -- so re-running after
+    a revision refreshes captions without duplicating or renumbering figures.
+    """
+    images_by_path = {img.get("path"): img for img in images if img.get("path")}
+    raw_lines = content_md.split("\n")
+    lines: list[str] = []
+    fig_no = 0
+    # ref_key (e.g. "fig:1") -> actual displayed figure number, so a
+    # cross-reference survives when extracted/social images shift the running
+    # count ahead of a planned figure.
+    ref_to_fig_no: dict[str, int] = {}
+    i = 0
+    while i < len(raw_lines):
+        line = raw_lines[i]
+        match = re.match(r"^\s*!\[([^\]]*)\]\(([^)]+)\)\s*$", line)
+        if not match:
+            lines.append(line)
+            i += 1
+            continue
+        alt, path = match.group(1), match.group(2)
+        img = images_by_path.get(path, {})
+        # Social proof cards are credibility cards, not numbered figures:
+        # keep the image in place but skip the 图N caption line so they
+        # neither inflate the figure count nor steal a number from a planned
+        # figure appearing later in the flow.
+        if img.get("source") == "social_proof":
+            lines.append(f"![{alt}]({path})")
+            lines.append("")
+            i += 1
+            continue
+        fig_no += 1
+        caption = (
+            img.get("caption")
+            or img.get("alt")
+            or img.get("prompt")
+            or alt
+            or "示意图"
+        )
+        # Check whether a caption already follows this image (L2 refresh path).
+        j = i + 1
+        while j < len(raw_lines) and not raw_lines[j].strip():
+            j += 1
+        existing = None
+        if j < len(raw_lines):
+            cap_match = re.match(r"^\*\*图(\d+)：\*\*", raw_lines[j])
+            if cap_match:
+                existing = (j, cap_match.group(1))
+        # Display number: keep the existing L2 number, else the running count.
+        display_no = int(existing[1]) if existing else fig_no
+        ref_key = img.get("ref_key")
+        if ref_key:
+            ref_to_fig_no[ref_key] = display_no
+        lines.append(f"![{alt}]({path})")
+        lines.append("")
+        if existing:
+            lines.append(f"**图{existing[1]}：** {caption}")
+            i = existing[0] + 1
+        else:
+            lines.append(f"**图{fig_no}：** {caption}")
+            lines.append("")
+            i += 1
+    text = "\n".join(lines)
+    # Resolve cross-reference placeholders using the ref_key -> figure-number
+    # map built during numbering. Fall back to the placeholder's own N when no
+    # image carries that ref_key (e.g. images not yet injected).
+    def _resolve_ref(m: re.Match) -> str:
+        ref_key = f"fig:{int(m.group(1))}"
+        if ref_key in ref_to_fig_no:
+            return f"（如图{ref_to_fig_no[ref_key]}所示）"
+        if not images:
+            # No images injected -- use the plan index so a draft with
+            # placeholders but no figures still reads naturally.
+            return f"（如图{int(m.group(1))}所示）"
+        # Images exist but this ref_key has no anchor: its planned figure was
+        # never generated. Falling back to the plan index N would point at the
+        # Nth image by position (unrelated), and neutralizing to "下图" left
+        # the word stranded mid-sentence or at paragraph ends. Delete the
+        # placeholder outright -- no reference beats a false one.
+        return ""
+
+    text = re.sub(r"\{\{\s*ref:fig:(\d+)\s*\}\}", _resolve_ref, text)
+    # Collapse double-wrapped refs ("（（如图N所示））" -> "（如图N所示）") left
+    # when the writer wrapped the placeholder in its own parentheses.
+    text = re.sub(r"（（如图(\d+)所示））", r"（如图\1所示）", text)
+    # Tidy the gaps deleted placeholders leave behind: stray spaces before
+    # newlines, around CJK punctuation ("。 对研究团队" -> "。对研究团队"),
+    # and doubled spaces between CJK characters ("见  与" -> "见与").
+    text = re.sub(r" +\n", "\n", text)
+    text = re.sub(r"([。！？；，、：]) +", r"\1", text)
+    text = re.sub(r" +([。！？；，、：])", r"\1", text)
+    text = re.sub(r"([一-鿿]) +([一-鿿])", r"\1\2", text)
+    return text
+
+
 def generate_image_prompts(
     project_title: str,
     research_question: str,
@@ -96,10 +259,42 @@ def generate_image_prompts(
 
 
 def fetch_image(prompt: str, width: int = DEFAULT_WIDTH, height: int = DEFAULT_HEIGHT) -> bytes | None:
-    """Fetch a generated image from Pollinations.ai.
+    """Generate an illustration for *prompt*.
 
-    Returns the raw image bytes, or None on failure.
+    Priority: designated image-generation model (llm_settings 里指定的生图
+    配置，OpenAI 兼容 /images/generations) → Pollinations.ai 免费回退。
+    Returns raw image bytes, or None when both fail.
     """
+    # ── 1) designated text-to-image model ──
+    try:
+        from app.services.llm_service import generate_image, image_gen_configured
+
+        if image_gen_configured():
+            size = f"{width}x{height}"
+            result = generate_image(prompt, size=size, timeout=90.0)
+            if result.get("image_bytes"):
+                logger.info("Image generated via designated image model")
+                return result["image_bytes"]
+            # 部分平台只返回 URL：下载之
+            url = result.get("image_url")
+            if url:
+                try:
+                    with httpx.Client(timeout=IMAGE_FETCH_TIMEOUT, follow_redirects=True, verify=False) as client:
+                        resp = client.get(url)
+                        resp.raise_for_status()
+                        if "image" in resp.headers.get("content-type", ""):
+                            logger.info("Image generated via designated image model (url)")
+                            return resp.content
+                except Exception:
+                    logger.debug("Failed to download generated image url", exc_info=True)
+            logger.warning(
+                "Designated image model failed (%s); falling back to Pollinations",
+                result.get("error"),
+            )
+    except Exception:
+        logger.debug("Image model path unavailable; using Pollinations", exc_info=True)
+
+    # ── 2) Pollinations free fallback ──
     import urllib.parse
     encoded = urllib.parse.quote(prompt[:300])  # Truncate long prompts
     url = f"{POLLINATIONS_BASE_URL}/{encoded}?width={width}&height={height}&nologo=true&seed=42"
@@ -145,10 +340,21 @@ def generate_article_images(
     sections: list[str],
     article_type: str,
     draft_content: str = "",
+    evidence_cards: list[dict[str, Any]] | None = None,
+    kind_by_section: dict[str, str] | None = None,
+    skip_sections: set[str] | None = None,
+    caption_by_section: dict[str, str] | None = None,
 ) -> list[dict[str, str]]:
     """Full pipeline: generate prompts → fetch images → save to disk.
 
     Falls back to SVG template engine if external image APIs are unavailable.
+
+    F2: ``evidence_cards`` binds SVG data extraction to real evidence text
+    (no inferred numbers); ``kind_by_section`` (from the figure plan) routes
+    quantitative claims to data-chart templates. ``caption_by_section``
+    (evidence-grounded plan captions) is appended to the generation prompt so
+    a real image model draws what the caption describes, not a loose guess
+    from the section title alone.
 
     Returns list of dicts: [{"section": "...", "filename": "...", "path": "/api/...", "prompt": "..."}]
     """
@@ -156,13 +362,28 @@ def generate_article_images(
     if not prompts:
         return []
 
+    evidence_text = _format_evidence_for_svg(evidence_cards or [])
+    kind_by_section = kind_by_section or {}
+    caption_by_section = caption_by_section or {}
+    # Canonical keys of sections that already carry a matplotlib data chart;
+    # the SVG dashboard there would visualize the same metrics twice.
+    skip_sections = skip_sections or set()
+
     results: list[dict[str, str]] = []
     for i, prompt_info in enumerate(prompts):
         section = prompt_info.get("section", f"section_{i}")
+        if resolve_section_key(section) in skip_sections:
+            logger.info("Skipping image for '%s' (matplotlib chart already covers it)", section)
+            continue
         prompt = prompt_info.get("prompt", "")
         style = prompt_info.get("style", "infographic")
         if not prompt:
             continue
+
+        # 生图模型按证据语境作画：计划图注（中文）描述了这节真正要展示的内容
+        caption = caption_by_section.get(section) or caption_by_section.get(resolve_section_key(section)) or ""
+        if caption:
+            prompt = f"{prompt}. The illustration must visually convey this idea: {caption[:200]}"
 
         # Extract section content from draft for richer SVG generation
         section_content = _extract_section_content(draft_content, section)
@@ -189,6 +410,8 @@ def generate_article_images(
                 prompt=prompt,
                 index=i,
                 section_content=section_content,
+                kind=kind_by_section.get(section, ""),
+                evidence_text=evidence_text,
             )
             if svg_content:
                 filename = f"img_{i:02d}_{section[:20].replace(' ', '_').replace('/', '_')}.svg"
@@ -205,17 +428,42 @@ def generate_article_images(
     return results
 
 
+# F2: plan kind -> template routing. "chart" (quantitative claim) renders as a
+# metrics dashboard; "illustration" keeps section-based selection.
+_KIND_TEMPLATE: dict[str, tuple[str, str]] = {"chart": ("metrics_dashboard", "ocean")}
+
+
+def _format_evidence_for_svg(cards: list[dict[str, Any]]) -> str:
+    """Compact evidence-card text used as the verbatim-data source for figures."""
+    lines: list[str] = []
+    for i, card in enumerate(cards):
+        claim = str(card.get("claim") or card.get("_clean_claim") or "")[:200]
+        support = str(card.get("supporting_text") or "")[:400]
+        if claim or support:
+            lines.append(f"[{i}] claim: {claim}")
+            if support:
+                lines.append(f"    data: {support}")
+        if len(lines) >= 32:
+            break
+    return "\n".join(lines)
+
+
 def generate_svg_illustration(
     section: str,
     project_title: str,
     prompt: str,
     index: int,
     section_content: str = "",
+    kind: str = "",
+    evidence_text: str = "",
 ) -> str | None:
     """Generate a professional SVG illustration using the template engine.
 
     Uses LLM to extract structured data from the section, then renders via
     pre-designed Python templates for magazine-quality output.
+
+    F2: extraction is bound to the evidence cards (``evidence_text``) and must
+    only use values that appear verbatim there -- never "合理推断" numbers.
     """
     from app.services.llm_service import chat_completion
     from app.services.svg_templates import (
@@ -228,7 +476,11 @@ def generate_svg_illustration(
     )
     import json as _json
 
-    template_type, theme_key = get_template_for_section(section)
+    # Route by planned kind first (data chart), section name as fallback.
+    if kind in _KIND_TEMPLATE:
+        template_type, theme_key = _KIND_TEMPLATE[kind]
+    else:
+        template_type, theme_key = get_template_for_section(section)
 
     # Determine what data schema to request from the LLM based on template type
     schema_prompts = {
@@ -259,9 +511,11 @@ def generate_svg_illustration(
     system_prompt = (
         "你是一位数据可视化专家。请从给定的文章章节中提取关键信息，"
         "并按照指定的 JSON 格式输出结构化数据。这些数据将用于生成信息图表。\n\n"
-        "规则：\n"
-        "- 只提取章节中明确提到的信息\n"
-        "- 如果某项信息未提及，用合理的推断填充\n"
+        "规则（F2 数据真实性）：\n"
+        "- 只提取章节内容或证据卡中明确提到的信息\n"
+        "- **禁止推断或编造**：如果某项数据未提及，数值字段留空或省略该条目，"
+        "绝不使用'合理推断'的数值\n"
+        "- 所有数值、名称、指标必须能在提供的章节内容或证据卡中逐字找到\n"
         "- emoji 用单个表情符号表示概念\n"
         "- 所有文本使用中文\n"
         "- 数值尽量用数字表示\n"
@@ -273,6 +527,10 @@ def generate_svg_illustration(
         f"章节：{section}\n"
         f"章节描述：{prompt}\n\n"
         f"章节内容摘要：\n{section_content[:1200] if section_content else prompt}\n\n"
+    )
+    if evidence_text:
+        user_prompt += f"证据卡数据（提取的数值必须逐字出自以下内容）：\n{evidence_text}\n\n"
+    user_prompt += (
         f"{schema_prompt}\n\n"
         f"只输出 JSON。"
     )
@@ -295,6 +553,41 @@ def generate_svg_illustration(
                 text = match.group(1)
 
         data = _json.loads(text)
+
+        # F2 deterministic backstop: drop numeric entries whose value cannot
+        # be found verbatim in the evidence/section corpus. The prompt rule
+        # alone let invented numbers onto dashboards.
+        from app.services.chart_service import matches_evidence_number
+
+        _num_re = re.compile(r"[-+]?\d+(?:\.\d+)?")
+        corpus = f"{evidence_text}\n{section_content}"
+
+        def _verified(value: Any) -> bool:
+            m = _num_re.search(str(value or ""))
+            if not m:
+                return True  # non-numeric text: nothing to verify
+            return matches_evidence_number(m.group(0), corpus)
+
+        if template_type == "metrics_dashboard":
+            original_metrics = [m for m in data.get("metrics", []) if isinstance(m, dict)]
+            metrics = [
+                m for m in original_metrics
+                if _verified(m.get("value")) and _verified(m.get("delta"))
+            ]
+            if original_metrics and not metrics:
+                logger.warning("SVG metrics all failed verbatim validation for '%s'; dropping illustration", section)
+                return None
+            data["metrics"] = metrics
+        elif template_type == "comparison":
+            original_items = [it for it in data.get("items", []) if isinstance(it, dict)]
+            items = [
+                it for it in original_items
+                if _verified(it.get("score"))
+            ]
+            if original_items and not items:
+                logger.warning("SVG comparison items all failed verbatim validation for '%s'; dropping illustration", section)
+                return None
+            data["items"] = items
 
         # Rotate theme based on index for variety
         theme = THEME_KEYS[index % len(THEME_KEYS)]
@@ -334,6 +627,30 @@ def generate_svg_illustration(
         return None
 
 
+# ── Chinese ↔ English section alias map (shared: injection & plan matching) ──
+_SECTION_ALIASES: dict[str, list[str]] = {
+    "background": ["背景", "研究背景", "背景介绍", "引言", "introduction"],
+    "framework": ["框架", "方法", "技术架构", "关键技术", "方法论", "methods", "approach"],
+    "results": ["实验结果", "结果", "实验", "评测", "性能", "results", "evaluation", "experiments"],
+    "discussion": ["讨论", "分析", "讨论与分析", "discussion", "analysis"],
+    "conclusion": ["结论", "总结", "展望", "conclusion", "summary"],
+}
+
+
+def resolve_section_key(section: str) -> str:
+    """Normalize a section name to a canonical key (实验结果与分析 -> results).
+
+    Plan sections are LLM-generated topical headings while image sections are
+    hardcoded English tags; exact string matching between the two almost
+    always fails, so every section join goes through this canonicalization.
+    """
+    s = (section or "").strip().lower()
+    for canonical, aliases in _SECTION_ALIASES.items():
+        if s == canonical or any(a in s or s in a for a in aliases):
+            return canonical
+    return s
+
+
 def inject_images_into_markdown(content_md: str, images: list[dict[str, str]]) -> str:
     """Insert images into article markdown using a position-based strategy.
 
@@ -347,22 +664,9 @@ def inject_images_into_markdown(content_md: str, images: list[dict[str, str]]) -
     if not images:
         return content_md
 
-    # ── Chinese ↔ English section alias map ──────────────────────
-    _SECTION_ALIASES: dict[str, list[str]] = {
-        "background": ["背景", "研究背景", "背景介绍", "引言", "introduction"],
-        "framework": ["框架", "方法", "技术架构", "关键技术", "方法论", "methods", "approach"],
-        "results": ["实验结果", "结果", "实验", "评测", "性能", "results", "evaluation", "experiments"],
-        "discussion": ["讨论", "分析", "讨论与分析", "discussion", "analysis"],
-        "conclusion": ["结论", "总结", "展望", "conclusion", "summary"],
-    }
-
     def _resolve_section(img_section: str) -> str:
         """Normalize an image's section tag to a canonical key."""
-        s = img_section.strip().lower()
-        for canonical, aliases in _SECTION_ALIASES.items():
-            if s == canonical or any(a in s or s in a for a in aliases):
-                return canonical
-        return s  # return as-is for unknown sections
+        return resolve_section_key(img_section)
 
     # ── Categorise images by canonical section ───────────────────
     section_buckets: dict[str, list[dict[str, str]]] = {}
