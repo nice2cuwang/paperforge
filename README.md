@@ -79,7 +79,7 @@ graph LR
 ### 1. 克隆并配置
 
 ```bash
-git clone https://github.com/WangZheng/PaperForge.git
+git clone https://github.com/nice2cuwang/paperforge.git
 cd PaperForge
 cp .env.example .env
 ```
@@ -321,12 +321,14 @@ python -m pytest tests/ -v --tb=short
 
 ## 网络故障排查
 
-如果后端日志中出现 `127.0.0.1:7890` 连接失败，说明容器内使用了错误的代理地址。在 `.env` 中配置：
+如果后端日志中出现 `127.0.0.1:<代理端口>` 连接失败，说明容器内使用了指向容器自身的代理地址。容器内应通过宿主机网关访问本机代理，在 `.env` 中配置：
 
 ```env
-PAPERFORGE_PROXY_URL=http://host.docker.internal:7890
+PAPERFORGE_PROXY_URL=http://host.docker.internal:7890   # 替换为你本机的代理端口
 PAPERFORGE_PROXY_HOST=host.docker.internal
 ```
+
+Docker 环境已内置 `host.docker.internal` 网关映射；未启用代理时保持 `.env` 中该变量为空即可。
 
 然后重启后端：
 
@@ -338,4 +340,6 @@ docker compose up -d --build backend
 
 ## License
 
-本项目暂未指定开源许可证。如需贡献或使用，请联系项目维护者确认许可条款。
+Copyright © 2026 WangZheng
+
+Licensed under the [Apache License, Version 2.0](LICENSE). 详见 [LICENSE](LICENSE) 文件。

@@ -10,7 +10,9 @@ services:
       - .env
     environment:
       WATCHFILES_FORCE_POLLING: "true"
-      PAPERFORGE_PROXY_URL: "http://host.docker.internal:7897"
+      # Optional outbound proxy for search/download; leave empty when not needed.
+      # Configure PAPERFORGE_PROXY_URL in .env (see .env.example).
+      PAPERFORGE_PROXY_URL: "${PAPERFORGE_PROXY_URL:-}"
     volumes:
       - ./backend/app:/app/app
       - ./backend/data:/app/data
