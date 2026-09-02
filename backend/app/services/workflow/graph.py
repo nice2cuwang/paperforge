@@ -59,6 +59,7 @@ from app.services.workflow.search_select import (
     _paper_query_score,
     _query_tokens,
     _text_query_score,
+    normalize_title,
     run_search_and_select,
 )
 from app.services.writing_service import (
@@ -123,6 +124,10 @@ class WorkflowState(TypedDict, total=False):
     community_evidence_count: int
     llm_knowledge_count: int
     cards: list[EvidenceCard]
+
+    # Evidence gap (W6, outline-driven per-section backfill)
+    gap_added_count: int
+    low_evidence_sections: list[str]
 
     # Conflict detection (S4)
     conflict_groups: list[dict[str, Any]]
@@ -199,6 +204,8 @@ def _build_initial_state(
         community_evidence_count=0,
         llm_knowledge_count=0,
         cards=[],
+        gap_added_count=0,
+        low_evidence_sections=[],
         draft=None,
         current_content="",
         draft_sections=[],
@@ -1156,6 +1163,7 @@ def draft_node(state: WorkflowState) -> dict[str, Any]:
         figure_plans=state.get("figure_plans") or None,
         conflict_groups=state.get("conflict_groups") or None,
         papers_off_topic=bool(state.get("papers_off_topic", False)),
+        low_evidence_sections=state.get("low_evidence_sections") or None,
     )
     draft = Draft(
         id=str(uuid4()),
@@ -1210,6 +1218,231 @@ def thesis_thread_node(state: WorkflowState) -> dict[str, Any]:
     )
     add_log(task_id, f"thesis thread: {thesis[:100]}")
     return {"thesis_statement": thesis, "draft_sections": sections}
+
+
+# ── Node 4a1: evidence_gap (W6) ─────────────────────────────────
+# 大纲驱动的定向证据补齐：每个章节标题被改写为检索式后，对本地 chunk 做
+# 定向召回，把“检索命中但尚未进入证据池”的高分 chunk 补成证据卡——证据从
+# “捞到什么写什么”变成“这一节要写什么→缺什么→定向补齐”。检索不到本地
+# 材料的节记入 low_evidence_sections，写作端据此保守落笔、不做推测性展开。
+# 词法门控与 vector rescue 沿用 evidence_node 的混合链路口径（CJK 友好），
+# vector 不可用时自动纯词法；本节点只增卡，绝不抛错阻塞工作流。
+
+_GAP_MIN_SCORE = 0.08
+_GAP_MAX_PER_SECTION = 2
+_GAP_MAX_TOTAL = 8
+
+
+def _clean_section_heading(section: str) -> str:
+    """Strip markdown heading / list-numbering prefixes off a section title."""
+    text = (section or "").strip()
+    text = re.sub(r"^#{1,6}\s*", "", text)
+    text = re.sub(r"^\d+\s*[\.\)、．]\s*", "", text)
+    text = re.sub(r"^[一二三四五六七八九十]+\s*[、\.\)．]\s*", "", text)
+    return text.strip()
+
+
+def _rewrite_section_queries(
+    sections: list[str], project_title: str, research_question: str
+) -> list[str] | None:
+    """Batch-rewrite section titles into retrieval queries (one LLM call).
+
+    Returns one query per section, or ``None`` when the LLM is unavailable so
+    the caller falls back to the cleaned heading itself.
+    """
+    import json as _json
+
+    from app.services.llm_service import chat_completion
+
+    try:
+        listing = "\n".join(f"[{i}] {s}" for i, s in enumerate(sections))
+        result = chat_completion(
+            system_prompt=(
+                "你是一位文献检索专家。把文章章节标题改写成适合在论文语料中检索的"
+                "检索式：保留原标题的核心语义与语言，去掉套话，可补充 1-3 个与"
+                "研究主题相关的关键词。每节 1 个检索式，20 字以内。"
+            ),
+            user_prompt=(
+                f"研究主题：{project_title or ''}\n"
+                f"研究问题：{research_question or ''}\n\n"
+                f"章节列表：\n{listing}\n\n"
+                f"输出 JSON 数组：[{{\"index\": 0, \"query\": \"...\"}}, ...]，只输出 JSON。"
+            ),
+            max_tokens=1024,
+            timeout=60.0,
+        )
+        text = (result.get("content") or "").strip()
+        if not text or result.get("error"):
+            return None
+        if "```" in text:
+            match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
+            if match:
+                text = match.group(1)
+        queries: list[str | None] = [None] * len(sections)
+        for entry in _json.loads(text):
+            idx = entry.get("index", -1)
+            query = str(entry.get("query") or "").strip()
+            if 0 <= idx < len(sections) and query:
+                queries[idx] = query[:200]
+        if any(q for q in queries):
+            return [q or "" for q in queries]
+    except Exception:
+        logger.exception("Section query rewrite failed, using heading fallback")
+    return None
+
+
+def evidence_gap_node(state: WorkflowState) -> dict[str, Any]:
+    task_id = state["task_id"]
+    db = state["db"]
+    project_id = state["project_id"]
+    cards = list(state.get("cards") or [])
+    papers = list(state.get("selected_papers") or [])
+    sections = list(state.get("draft_sections") or [])
+    project = state.get("project")
+
+    add_log(task_id, "langgraph: evidence_gap")
+    set_progress(task_id, 78, "closing per-section evidence gaps")
+
+    if not sections or not papers:
+        return {"gap_added_count": 0, "low_evidence_sections": []}
+
+    # Chunk ids already represented by the active evidence pool (post-filter).
+    covered_ids: set[str] = set()
+    for card in cards:
+        for cid in (card.chunk_ids or []):
+            if cid:
+                covered_ids.add(str(cid))
+
+    # Pre-normalize each chunk once so per-section scoring is a cheap hit test
+    # instead of re-tokenizing every chunk text for every section.
+    payloads_by_id: dict[str, tuple[Any, dict[str, Any]]] = {}
+    for paper in papers:
+        chunks = list(
+            db.scalars(
+                select(PaperChunk).where(PaperChunk.paper_id == paper.id).order_by(PaperChunk.created_at)
+            ).all()
+        )
+        for chunk in chunks:
+            text = chunk.text or ""
+            payload = {
+                "id": str(chunk.id),
+                "text": text,
+                "page_start": chunk.page_start,
+                "page_end": chunk.page_end,
+            }
+            payloads_by_id[str(chunk.id)] = (paper, payload)
+    if not payloads_by_id:
+        return {"gap_added_count": 0, "low_evidence_sections": []}
+    norm_by_id = {pid: normalize_title(payload["text"]) for pid, (_, payload) in payloads_by_id.items()}
+
+    context = (project.research_question if project is not None else "") or state.get("query", "")
+    title = project.title if project is not None else ""
+    rewritten = _rewrite_section_queries(sections, title or "", context or "")
+    queries: list[str] = []
+    for i, section in enumerate(sections):
+        if rewritten is not None and i < len(rewritten) and rewritten[i]:
+            queries.append(rewritten[i])
+        else:
+            queries.append(_clean_section_heading(section))
+
+    vector_ok = True
+    vector_logged = False
+    added_cards: list[EvidenceCard] = []
+    low_sections: list[str] = []
+    added_total = 0
+
+    for idx, section in enumerate(sections):
+        qtext = (queries[idx] if idx < len(queries) else "").strip()
+        query_tokens = _query_tokens(qtext)
+        if not qtext or not query_tokens:
+            add_log(task_id, f"evidence_gap: skipped section '{section[:24]}' (no query terms)")
+            continue
+
+        # 可选向量召回（每节一次；失败后整体禁用，沿用 evidence_node 降级口径）
+        recall_ids: list[str] = []
+        if vector_ok:
+            try:
+                from app.services.retrieval_service import recall_chunks
+
+                recall_ids = [
+                    str(hit.get("id"))
+                    for hit in recall_chunks(qtext, project_id=project_id, top_k=60)
+                    if hit.get("id")
+                ]
+            except Exception:
+                vector_ok = False
+                if not vector_logged:
+                    add_log(task_id, "evidence_gap: vector recall unavailable; lexical scoring only")
+                    vector_logged = True
+
+        # 词法打分（与 _text_query_score 同口径，但 haystack 已预归一化）
+        scored: list[tuple[float, str]] = []
+        for pid, norm_text in norm_by_id.items():
+            hits = sum(1 for token in query_tokens if token in norm_text)
+            scored.append((hits / max(1, len(query_tokens)), pid))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        lex_max = max((s for s, _ in scored), default=0.0)
+
+        # 词法门控阈值口径与 evidence_node 一致
+        if lex_max < _GAP_MIN_SCORE:
+            candidates: list[str] = []
+        else:
+            threshold = max(0.12, lex_max * 0.45) if query_tokens else max(0.06, lex_max * 0.4)
+            candidates = [pid for s, pid in scored if s >= threshold][:8]
+
+        # vector rescue：把语义命中但未过词法门控的同主题 chunk 并入候选，
+        # 排序时向量命中在前、纯词法命中按词法分在后（与 evidence_node 一致）
+        if recall_ids:
+            ranked = [pid for pid in recall_ids if pid in payloads_by_id and pid not in candidates]
+            if ranked:
+                rank_of = {pid: r for r, pid in enumerate(ranked[:6])}
+                lex_rank = {pid: i for i, pid in enumerate(candidates)}
+                pool = candidates + [pid for pid in ranked if pid in rank_of]
+                pool.sort(key=lambda p: (0, rank_of[p]) if p in rank_of else (1, lex_rank[p]))
+                candidates = pool
+
+        if not candidates:
+            low_sections.append(section)
+            add_log(task_id, f"evidence_gap: section '{section[:24]}' has no matching local evidence")
+            continue
+
+        per_section = 0
+        for pid in candidates:
+            if per_section >= _GAP_MAX_PER_SECTION or added_total >= _GAP_MAX_TOTAL:
+                break
+            if pid in covered_ids:
+                continue  # 该 chunk 已有证据卡（且未被 relevance 过滤），视为已覆盖
+            paper, payload = payloads_by_id[pid]
+            for item in build_evidence_from_chunks(paper.id, [payload], limit=1):
+                card = EvidenceCard(
+                    id=str(uuid4()), project_id=project_id, paper_id=paper.id,
+                    chunk_ids=item["chunk_ids"], claim=item["claim"], supporting_text=item["supporting_text"],
+                    evidence_type=item["evidence_type"], source_type="academic", strength=item["strength"],
+                    limitations=item["limitations"], page_start=item["page_start"], page_end=item["page_end"],
+                    citation_key=item["citation_key"], used_in_draft=False,
+                    created_at=_now(), updated_at=_now(),
+                )
+                db.add(card)
+                added_cards.append(card)
+                covered_ids.add(pid)
+                added_total += 1
+                per_section += 1
+
+    if added_cards:
+        db.flush()
+        add_log(task_id, f"evidence_gap: added {len(added_cards)} cards for under-covered sections")
+    if low_sections:
+        add_log(
+            task_id,
+            f"evidence_gap: {len(low_sections)} sections lack local evidence: "
+            f"{[s[:20] for s in low_sections]}",
+        )
+
+    return {
+        "gap_added_count": added_total,
+        "low_evidence_sections": low_sections,
+        "cards": cards + added_cards,
+    }
 
 
 # ── Node 4b: plan_figures (F1) ─────────────────────────────────
@@ -1913,6 +2146,8 @@ def result_node(state: WorkflowState) -> dict[str, Any]:
         "evidence_count": state["evidence_count"],
         "metadata_fallback_evidence_count": state["metadata_fallback_evidence_count"],
         "low_relevance_filtered_count": state["low_relevance_filtered_count"],
+        "gap_added_count": state.get("gap_added_count", 0),
+        "low_evidence_sections": state.get("low_evidence_sections", []),
         "draft_id": state["draft"].id,
         "revised_draft_id": state["revised_draft"].id,
         "review_issue_count": len(state["created_issues"]),
@@ -1979,6 +2214,7 @@ def create_workflow_graph():
     builder.add_node("relevance_filter", _timed_node("filter", "relevance_filter", relevance_filter_node))
     builder.add_node("conflict_detection", _timed_node("filter", "conflict_detection", conflict_detection_node))
     builder.add_node("thesis_thread", _timed_node("draft", "thesis_thread", thesis_thread_node))
+    builder.add_node("evidence_gap", _timed_node("evidence", "evidence_gap", evidence_gap_node))
     builder.add_node("plan_figures", _timed_node("draft", "plan_figures", plan_figures_node))
     builder.add_node("generate_draft", _timed_node("draft", "generate_draft", draft_node))
     builder.add_node("generate_images", _timed_node("images", "generate_images", image_generation_node))
@@ -1998,7 +2234,8 @@ def create_workflow_graph():
     builder.add_edge("gather_community_sources", "relevance_filter")
     builder.add_edge("relevance_filter", "conflict_detection")
     builder.add_edge("conflict_detection", "thesis_thread")
-    builder.add_edge("thesis_thread", "plan_figures")
+    builder.add_edge("thesis_thread", "evidence_gap")
+    builder.add_edge("evidence_gap", "plan_figures")
     builder.add_edge("plan_figures", "generate_draft")
     builder.add_edge("generate_draft", "generate_images")
     builder.add_edge("generate_images", "initial_review")

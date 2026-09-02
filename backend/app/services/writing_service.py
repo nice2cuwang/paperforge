@@ -824,6 +824,7 @@ def _llm_write_section(
     next_section: str = "",
     figure_plan: str = "",
     conflict_note: str = "",
+    low_evidence: bool = False,
 ) -> str:
     """Ask LLM to write a coherent section. Falls back to template rendering on error."""
     cards_text = _format_cards_for_prompt(section_cards) if section_cards else ""
@@ -868,6 +869,13 @@ def _llm_write_section(
         )
     if conflict_note:
         user_prompt += f"**证据冲突提示（S4）**：{conflict_note}\n"
+    if low_evidence:
+        user_prompt += (
+            f"**证据缺口提示（W6）**：定向检索未能在本地语料中找到充分支撑本节的证据。"
+            f"若下发的证据卡与本节主题关联弱，请优先做克制的概述与有明确限定的推演"
+            f"（使用「从技术角度分析」「可以合理推断」等表述），不要把弱相关卡片写成"
+            f"确定事实结论；可适当压缩篇幅，不必凑满目标字数。\n"
+        )
     role_instruction = _section_role_instruction(section, section_index, total_sections)
     if role_instruction:
         user_prompt += f"{role_instruction}\n"
@@ -1199,6 +1207,7 @@ def build_draft_markdown(
     figure_plans: list[dict[str, Any]] | None = None,
     conflict_groups: list[dict[str, Any]] | None = None,
     papers_off_topic: bool = False,
+    low_evidence_sections: list[str] | None = None,
 ) -> tuple[str, list[str]]:
     """Generate the full draft article as Markdown.
 
@@ -1309,6 +1318,11 @@ def build_draft_markdown(
             for cid in group.get("card_ids", []):
                 group_by_card_id[str(cid)] = group
 
+    # W6: sections that the evidence-gap node could not backfill with local
+    # evidence get a conservative-writing instruction in the prompt instead of
+    # letting the writer fabricate depth from weakly-related cards.
+    low_evidence_set = {str(s).strip() for s in (low_evidence_sections or [])}
+
     prev_tail = ""
     for idx, section in enumerate(sections):
         lines.append(f"## {section}")
@@ -1355,6 +1369,7 @@ def build_draft_markdown(
             next_section=sections[idx + 1] if idx + 1 < len(sections) else "",
             figure_plan=figure_plan,
             conflict_note=conflict_note,
+            low_evidence=(str(section).strip() in low_evidence_set),
         )
         lines.append(section_text)
         lines.append("")

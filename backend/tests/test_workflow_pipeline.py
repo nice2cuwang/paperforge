@@ -293,6 +293,9 @@ def test_run_auto_workflow_uses_local_pdf_and_finishes(client, monkeypatch):
     assert payload["revision_rounds_executed"] >= 0
     assert "publication_prepared" in payload
     assert "quality_gate" in payload
+    # evidence_gap 节点总是返回新键（hermetic 下词法回退，不抛错）
+    assert isinstance(payload["gap_added_count"], int)
+    assert isinstance(payload["low_evidence_sections"], list)
 
     drafts_res = client.get(f"/api/projects/{project_id}/drafts")
     assert drafts_res.status_code == 200
@@ -800,3 +803,86 @@ def test_run_auto_workflow_prefers_current_search_scope_over_stale_history(clien
 
     scoped_row = next(item for item in papers if item.get("doi") == "10.1234/current.scope.1")
     assert scoped_row["selected"] is True
+
+
+def test_evidence_gap_node_backfills_covered_section_and_flags_absent_section(
+    test_session_factory, monkeypatch
+):
+    """单节点验证（hermetic，无 LLM/向量）：有语料节补卡、无语料节进低证据清单。
+
+    LLM 改写检索式在 hermetic 下返回空 → 回落章节标题词法检索；向量召回被
+    hermetic 断言打断 → 纯词法。断言补卡与 flag 两个出口各走一路。
+    """
+    from uuid import uuid4
+
+    from sqlalchemy import select
+
+    from app.models import EvidenceCard, Paper, PaperChunk, Project
+    from app.services.workflow import graph as wg
+
+    monkeypatch.setattr(wg, "add_log", lambda *a, **k: None)
+    monkeypatch.setattr(wg, "set_progress", lambda *a, **k: None)
+
+    db = test_session_factory()
+    try:
+        project = Project(
+            id=str(uuid4()),
+            title="RAG 评测项目",
+            research_question="检索增强生成是否提升问答准确率",
+            article_type="policy_report",
+            language="zh",
+        )
+        db.add(project)
+        db.flush()
+        paper = Paper(
+            id=str(uuid4()),
+            project_id=project.id,
+            title="RAG 评测论文",
+            source="upload",
+            selected=True,
+            relevance_score=0.9,
+            metadata_json={},
+        )
+        db.add(paper)
+        db.flush()
+        chunk_hit = PaperChunk(
+            id=str(uuid4()),
+            paper_id=paper.id,
+            text="检索增强生成 RAG 评测显示在问答准确率与事实一致性上显著优于朴素 LLM 基线",
+            page_start=1,
+            page_end=1,
+        )
+        chunk_unrelated = PaperChunk(
+            id=str(uuid4()),
+            paper_id=paper.id,
+            text="量子引力与弦理论至今缺乏可检验的实验证据",
+            page_start=2,
+            page_end=2,
+        )
+        db.add_all([chunk_hit, chunk_unrelated])
+        db.commit()
+
+        state = {
+            "task_id": "unit-evidence-gap",
+            "db": db,
+            "project_id": project.id,
+            "query": "RAG 评测",
+            "selected_papers": [paper],
+            "cards": [],
+            "draft_sections": ["RAG 问答评测结果", "多模态医学影像诊断"],
+        }
+        out = wg.evidence_gap_node(state)
+
+        assert out["gap_added_count"] == 1
+        # 有本地语料的一节补上 chunk_hit 的证据卡
+        assert len(out["cards"]) == 1
+        assert out["cards"][0].chunk_ids == [chunk_hit.id]
+        # 语料完全缺失的一节进入低证据清单，且不被误补无关 chunk
+        assert out["low_evidence_sections"] == ["多模态医学影像诊断"]
+        # 卡片确实落库（供 plan_figures/draft 直接消费）
+        rows = db.scalars(
+            select(EvidenceCard).where(EvidenceCard.project_id == project.id)
+        ).all()
+        assert [card.chunk_ids for card in rows] == [[chunk_hit.id]]
+    finally:
+        db.close()
