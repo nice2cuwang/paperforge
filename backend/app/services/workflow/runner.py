@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.database import backend_dir
 from app.models import Draft, EvidenceCard, Paper, PaperChunk, ReviewIssue
 from app.schemas import RunAutoWorkflowRequest
-from app.services.task_registry import add_log, set_progress
+from app.services.task_registry import add_log, set_artifact, set_progress
 from app.services.evidence_service import build_evidence_from_chunks
 from app.services.writing_service import build_draft_markdown
 from app.services.review_service import review_draft_with_metrics, revise_draft, score_quality
@@ -49,6 +49,17 @@ def _execute_auto_workflow(
     When langgraph is installed, uses the StateGraph-based implementation
     (graph.py). Falls back to the inline implementation otherwise.
     """
+    # 任务上下文：让本次运行中所有 LLM 调用的审计日志归属到 task/project，
+    # 供 token 消耗统计聚合。
+    from app.services.llm_service import task_context
+
+    with task_context(task_id, project_id):
+        return _execute_auto_workflow_inner(project_id, payload, db, task_id)
+
+
+def _execute_auto_workflow_inner(
+    project_id: str, payload: RunAutoWorkflowRequest, db: Session, task_id: str
+) -> dict:
     try:
         from app.services.workflow.graph import _build_initial_state, _workflow_graph
         add_log(task_id, "enter _execute_auto_workflow (langgraph)")
@@ -88,14 +99,14 @@ def _execute_auto_workflow(
         add_log(task_id, f"cleaned up {old_paper_count} papers from previous run")
 
     _t0 = time.perf_counter()
-    selected_papers, inserted, reselection_triggered = run_search_and_select(
+    selected_papers, inserted, reselection_triggered, _rewritten_queries, _required_terms = run_search_and_select(
         project_id=project_id, query=query, auto_select_limit=payload.auto_select_limit,
         keep_manual_selection=payload.keep_manual_selection, max_results=payload.max_results,
         db=db, task_id=task_id,
     )
     _step_timings["search"] = round(time.perf_counter() - _t0, 3)
     add_log(task_id, f"search_and_select done: selected={len(selected_papers)}, inserted={inserted}")
-    del reselection_triggered
+    del reselection_triggered, _rewritten_queries, _required_terms
 
     if not selected_papers:
         provider_diag = _provider_diagnostics()
@@ -202,7 +213,7 @@ def _execute_auto_workflow(
                 db.add(EvidenceCard(
                     id=str(uuid4()), project_id=project_id, paper_id=paper.id, chunk_ids=[],
                     claim=item["claim"], supporting_text=item["supporting_text"],
-                    evidence_type=item["evidence_type"], strength="low",
+                    evidence_type=item["evidence_type"], source_type="academic", strength="low",
                     limitations="Metadata-only evidence (title/abstract). Full PDF unavailable.",
                     page_start=None, page_end=None, citation_key=item["citation_key"],
                     used_in_draft=False, created_at=_now(), updated_at=_now(),
@@ -247,6 +258,11 @@ def _execute_auto_workflow(
         status="draft", quality_score={"overall_score": 0.75}, created_at=_now(),
     )
     db.add(draft); db.flush()
+    # 增量提交：草稿一旦生成立即落盘，进程被杀也能从 drafts 表取回。
+    draft_id, draft_version = draft.id, draft.version
+    db.commit()
+    set_artifact(task_id, "draft_id", draft_id)
+    set_artifact(task_id, "draft_version", draft_version)
     add_log(task_id, "draft generated and flushed")
     _step_timings["draft"] = round(time.perf_counter() - _t_draft, 3)
     _t_review = time.perf_counter()
@@ -312,6 +328,11 @@ def _execute_auto_workflow(
         created_at=_now(),
     )
     db.add(revised_draft); db.flush()
+    # 增量提交：修订稿 + 审稿 issue 落盘，崩溃后可取回最新修订版本。
+    rd_id, rd_version = revised_draft.id, revised_draft.version
+    db.commit()
+    set_artifact(task_id, "draft_id", rd_id)
+    set_artifact(task_id, "draft_version", rd_version)
     _step_timings["review"] = round(time.perf_counter() - _t_review, 3)
     _t_export = time.perf_counter()
 

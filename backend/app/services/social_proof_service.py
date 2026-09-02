@@ -311,15 +311,41 @@ def generate_social_proof_cards(
     papers: list[Any],
     project_id: str,
     output_dir: Path,
+    research_question: str = "",
 ) -> list[dict[str, str]]:
     """Generate social proof cards for selected papers.
+
+    ``research_question`` gates topical relevance: a card broadcasts a paper's
+    title/citation count as a visual claim, so a card built from an off-topic
+    paper (e.g. green-construction management in a DeepSeek article) is worse
+    than no card at all. Papers sharing fewer than 2 content terms with the
+    query are skipped; if none pass, no cards are produced.
 
     Returns a list of image metadata dicts::
 
         [{"path": "...", "alt": "...", "section": "...", "source": "social_proof"}]
     """
+    from app.services.search_service import title_query_hits
+
     output_dir.mkdir(parents=True, exist_ok=True)
     cards: list[dict[str, str]] = []
+
+    # ── Topical relevance gate ──────────────────────────────────
+    if research_question:
+        eligible = [
+            p for p in papers
+            if title_query_hits(p.title or "", research_question) >= 2
+        ]
+        dropped = len(papers) - len(eligible)
+        if dropped:
+            logger.info(
+                "social proof: dropped %d off-topic papers (title shares <2 terms with the query)",
+                dropped,
+            )
+        if not eligible:
+            logger.info("social proof skipped: no paper is topically relevant to the query")
+            return []
+        papers = eligible
 
     # ── Collect data from APIs ─────────────────────────────────
     paper_meta: list[dict[str, Any]] = []

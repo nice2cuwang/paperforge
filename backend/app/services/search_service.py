@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from difflib import SequenceMatcher
+import math
 import re
 from typing import Any
 import xml.etree.ElementTree as ET
@@ -24,6 +26,7 @@ class PaperCandidate:
     oa_status: str | None
     license: str | None
     relevance_score: float
+    cited_by_count: int = 0
 
     def key(self) -> str:
         if self.doi:
@@ -309,6 +312,56 @@ def _decode_openalex_abstract(inverted_index: dict[str, list[int]] | None) -> st
     return " ".join(word for _, word in position_words)
 
 
+def _authority_score(cited_by_count: int, year: int | None) -> float:
+    """Authority: log-scaled citation count (65%) + recency (35%).
+
+    Citation counts span orders of magnitude (0 .. 100k+), so use log10
+    (capped at ~1000 citations -> 1.0). Recency decays linearly from the
+    current year to a floor of 0.4 at 20 years old.
+    """
+    cited = max(0, int(cited_by_count or 0))
+    citation_score = min(1.0, math.log10(1 + cited) / 3.0)
+    if year:
+        age = max(0, datetime.now().year - int(year))
+        recency = max(0.4, 1.0 - min(0.6, age / 20.0))
+    else:
+        recency = 0.5
+    return round(0.65 * citation_score + 0.35 * recency, 4)
+
+
+# ── Topical relevance signal ────────────────────────────────────────────
+
+_TERM_STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "what", "how",
+    "why", "which", "using", "based", "vs", "between", "study", "of", "in",
+    "on", "to", "a", "an",
+    "的", "了", "是", "在", "有", "和", "与", "对", "为", "从", "等", "及", "或",
+}
+_CJK_CHAR_RE = re.compile(r"[一-鿿]")
+
+
+def title_query_hits(title: str, query: str) -> int:
+    """Count content terms shared between a paper title and the research query.
+
+    ``relevance_score`` encodes authority (citations + recency) only: an
+    off-topic but well-cited paper still scores high, which is how a
+    "DeepSeek Harness" search pool filled up with green-construction and
+    party-building journal papers. This cheap term-overlap signal (latin
+    tokens + CJK character bigrams) is the topical check that score lacks.
+    """
+    def _terms(text: str) -> set[str]:
+        lowered = (text or "").lower()
+        tokens = {
+            t for t in re.split(r"[^a-z0-9]+", lowered)
+            if len(t) >= 2 and t not in _TERM_STOPWORDS
+        }
+        chars = _CJK_CHAR_RE.findall(lowered)
+        tokens.update(chars[i] + chars[i + 1] for i in range(len(chars) - 1))
+        return tokens
+
+    return len(_terms(title) & _terms(query))
+
+
 def _search_openalex(query: str, limit: int) -> list[PaperCandidate]:
     data = _safe_get_json(
         "https://api.openalex.org/works",
@@ -320,13 +373,14 @@ def _search_openalex(query: str, limit: int) -> list[PaperCandidate]:
         },
     )
     results: list[PaperCandidate] = []
-    for idx, work in enumerate(data.get("results", []), start=1):
+    for work in data.get("results", []):
         pdf_url = None
         locations = work.get("locations") or []
         for loc in locations:
             pdf_url = _clean((loc.get("pdf_url") or loc.get("landing_page_url")))
             if pdf_url:
                 break
+        year = work.get("publication_year")
         results.append(
             PaperCandidate(
                 title=_clean(work.get("title")) or "Untitled",
@@ -334,7 +388,7 @@ def _search_openalex(query: str, limit: int) -> list[PaperCandidate]:
                     _clean(author_item.get("author", {}).get("display_name")) or "Unknown"
                     for author_item in (work.get("authorships") or [])
                 ],
-                year=work.get("publication_year"),
+                year=year,
                 doi=_clean(work.get("doi")),
                 arxiv_id=None,
                 venue=_clean((work.get("primary_location") or {}).get("source", {}).get("display_name")),
@@ -343,8 +397,9 @@ def _search_openalex(query: str, limit: int) -> list[PaperCandidate]:
                 source_url=_clean(work.get("id")),
                 pdf_url=pdf_url,
                 oa_status=_clean((work.get("open_access") or {}).get("oa_status")),
-                license=_clean((work.get("open_access") or {}).get("oa_status")),
-                relevance_score=max(0.0, 1.0 - (idx * 0.02)),
+                license=_clean(work.get("license")),
+                cited_by_count=int(work.get("cited_by_count") or 0),
+                relevance_score=_authority_score(int(work.get("cited_by_count") or 0), year),
             )
         )
     return results
@@ -361,7 +416,7 @@ def _search_crossref(query: str, limit: int) -> list[PaperCandidate]:
         },
     )
     results: list[PaperCandidate] = []
-    for idx, work in enumerate(data.get("message", {}).get("items", []), start=1):
+    for work in data.get("message", {}).get("items", []):
         title_list = work.get("title") or []
         authors: list[str] = []
         for author in (work.get("author") or []):
@@ -386,7 +441,8 @@ def _search_crossref(query: str, limit: int) -> list[PaperCandidate]:
                 pdf_url=None,
                 oa_status="unknown",
                 license=None,
-                relevance_score=max(0.0, 0.88 - (idx * 0.02)),
+                cited_by_count=int(work.get("is-referenced-by-count") or 0),
+                relevance_score=_authority_score(int(work.get("is-referenced-by-count") or 0), year),
             )
         )
     return results
@@ -408,7 +464,7 @@ def _search_arxiv(query: str, limit: int) -> list[PaperCandidate]:
         return []
 
     results: list[PaperCandidate] = []
-    for idx, entry in enumerate(root.findall("atom:entry", ns), start=1):
+    for entry in root.findall("atom:entry", ns):
         title = (entry.findtext("atom:title", default="", namespaces=ns) or "").replace("\n", " ").strip()
         summary = (entry.findtext("atom:summary", default="", namespaces=ns) or "").replace("\n", " ").strip()
         identifier = (entry.findtext("atom:id", default="", namespaces=ns) or "").strip()
@@ -444,7 +500,8 @@ def _search_arxiv(query: str, limit: int) -> list[PaperCandidate]:
                 pdf_url=pdf_url,
                 oa_status="open",
                 license="arxiv",
-                relevance_score=max(0.0, 0.9 - (idx * 0.02)),
+                # arXiv has no citation metadata; authority falls back to recency only.
+                relevance_score=_authority_score(0, year),
             )
         )
     return results
@@ -520,7 +577,8 @@ def search_papers(query: str, limit: int = 20) -> list[PaperCandidate]:
     for item in deduped:
         query_score = _query_match_score(query, item)
         coverage_ratio, required_count = _facet_coverage_ratio(query, item)
-        blended = 0.42 * query_score + 0.33 * coverage_ratio + 0.25 * float(item.relevance_score or 0.0)
+        authority = _authority_score(item.cited_by_count, item.year)
+        blended = 0.40 * query_score + 0.30 * coverage_ratio + 0.30 * authority
         item.relevance_score = round(max(0.0, min(1.0, blended)), 4)
         scored_rows.append((item, query_score, coverage_ratio, required_count))
 

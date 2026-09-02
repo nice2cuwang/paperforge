@@ -47,57 +47,63 @@ def _vector_rank(query: str, project_id: str | None, top_k: int) -> list[dict[st
     return results
 
 
+def recall_chunks(
+    query: str,
+    project_id: str | None = None,
+    top_k: int = 50,
+) -> list[dict[str, Any]]:
+    """Vector-only recall from Qdrant (project-scoped).
+
+    Used by the main workflow evidence node to supplement lexical chunk
+    scoring. Raises on Qdrant/embedding failure; callers should catch.
+    """
+    return _vector_rank(query, project_id, top_k=top_k)
+
+
+# Reciprocal Rank Fusion constant: 1/(K + rank). 60 is the standard value
+# from the original RRF paper; it dampens the influence of top ranks so one
+# list cannot dominate the fusion.
+_RRF_K = 60
+
+
 def rank_chunks(
     query: str,
     chunks: list[dict[str, Any]],
     top_k: int = 20,
     project_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Hybrid retrieval: vector recall + lexical fallback + rerank.
+    """Hybrid retrieval: vector recall + lexical scoring fused via RRF.
 
-    Strategy:
-    1. Try vector search in Qdrant (project-scoped).
-    2. If Qdrant returns fewer than top_k/2 results, fall back to lexical scoring.
-    3. Merge, deduplicate, and return top_k.
+    Vector similarity and lexical cosine are on incomparable scales; the
+    previous per-list max-normalization let a weak list's top item masquerade
+    as 1.0 and outrank genuinely strong hits in the other list. Reciprocal
+    Rank Fusion only uses *ranks*, so both lists contribute comparably.
     """
     # Phase 1: Vector recall
     vector_results: list[dict[str, Any]] = []
     try:
         vector_results = _vector_rank(query, project_id, top_k=max(top_k, 20))
     except Exception:
-        # If Qdrant is unavailable, proceed with lexical fallback only
+        # If Qdrant is unavailable, proceed with lexical scoring only
         pass
 
-    # Phase 2: Lexical fallback on local chunks
+    # Phase 2: Lexical scoring on local chunks
     lexical_results = _lexical_rank(query, chunks)
 
-    # Phase 3: Merge and deduplicate by chunk id
-    seen: set[str] = set()
-    merged: list[dict[str, Any]] = []
-
-    # Normalize scores to [0, 1] for both sets
-    def _normalize(scored: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not scored:
-            return []
-        max_score = max(r["score"] for r in scored)
-        if max_score == 0:
-            return scored
-        return [{**r, "score": round(r["score"] / max_score, 6)} for r in scored]
-
-    vector_norm = _normalize(vector_results)
-    lexical_norm = _normalize(lexical_results)
-
-    # Boost vector results slightly (they tend to have better semantic relevance)
-    for r in vector_norm:
-        r["score"] = round(r["score"] * 1.1, 6)
-
-    for source in [vector_norm, lexical_norm]:
-        for r in source:
-            cid = str(r.get("id") or r.get("chunk_id") or "")
-            if cid in seen:
+    # Phase 3: Reciprocal Rank Fusion over both lists
+    scores: dict[str, float] = {}
+    entries: dict[str, dict[str, Any]] = {}
+    for results in (vector_results, lexical_results):
+        for rank, record in enumerate(results):
+            cid = str(record.get("id") or record.get("chunk_id") or "")
+            if not cid or cid in entries:
                 continue
-            seen.add(cid)
-            merged.append(r)
+            entries[cid] = record
+            scores[cid] = 0.0
+        for rank, record in enumerate(results):
+            cid = str(record.get("id") or record.get("chunk_id") or "")
+            if cid:
+                scores[cid] += 1.0 / (_RRF_K + rank + 1)
 
-    merged.sort(key=lambda item: item["score"], reverse=True)
-    return merged[: max(1, min(top_k, 200))]
+    fused = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    return [{**entries[cid], "score": round(score, 6)} for cid, score in fused[: max(1, min(top_k, 200))]]

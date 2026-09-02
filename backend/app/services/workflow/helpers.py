@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.database import backend_dir
 from app.models import Draft, EvidenceCard, Paper, Project
+from app.services.evidence_service import credibility_weight
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +75,31 @@ def _paper_to_dict(paper: Paper) -> dict:
 
 
 def _evidence_to_dict(card: EvidenceCard) -> dict:
+    # DOI from the parent paper: verify_evidence_dois (fact check layer)
+    # reads card["doi"]; without this key DOI verification is dead code.
+    try:
+        doi = card.paper.doi if getattr(card, "paper", None) else None
+    except Exception:
+        doi = None
+    # Paper title for the 延伸阅读 (background references) section —
+    # metadata-only cards' claim is abstract noise, the title reads better.
+    try:
+        paper_title = card.paper.title if getattr(card, "paper", None) else None
+    except Exception:
+        paper_title = None
+    # web 源发布日期（web_search_service 写入 metadata_json.published_hint）：
+    # 写作层据此做时效排序与"旧闻需注明时间背景"的提示。
+    try:
+        meta = card.paper.metadata_json if getattr(card, "paper", None) else None
+        published_hint = meta.get("published_hint") if isinstance(meta, dict) else None
+    except Exception:
+        published_hint = None
     return {
         "id": card.id,
         "paper_id": card.paper_id,
+        "paper_title": paper_title,
+        "published_hint": published_hint,
+        "doi": doi,
         "chunk_ids": card.chunk_ids,
         "claim": card.claim,
         "supporting_text": card.supporting_text,
@@ -86,6 +109,12 @@ def _evidence_to_dict(card: EvidenceCard) -> dict:
         "limitations": card.limitations,
         "page_start": card.page_start,
         "page_end": card.page_end,
+        # S3: computed credibility so the writer/filter can treat weak sources
+        # (web/community/llm_knowledge) differently from peer-reviewed papers.
+        "credibility_weight": credibility_weight(
+            card.source_type,
+            has_doi=bool(doi),
+        ),
     }
 
 

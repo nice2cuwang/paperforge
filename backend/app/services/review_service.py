@@ -10,10 +10,14 @@ from app.services.de_ai_service import de_ai_metrics
 from app.services.fact_check_service import fact_check_draft
 from app.services.llm_service import chat_completion_json, chat_completion_text
 from app.services.style_check_service import check_style
+from app.services.writing_service import strip_stray_llm_tags
 
 logger = logging.getLogger(__name__)
 
 EVIDENCE_COMMENT_RE = re.compile(r"<!--\s*evidence:\s*([^>]+?)\s*-->", re.IGNORECASE)
+# Honest-mode paragraphs (no evidence cards available) end with this marker:
+# counted as background knowledge, not as an evidence-gate violation.
+KNOWLEDGE_MARKER = "llm-knowledge"
 EVIDENCE_TAG_RE = re.compile(r"\[evidence:([a-zA-Z0-9-]+)\]")
 ABSOLUTE_TERMS = ("必然", "完全证明", "彻底", "毫无疑问", "一定会", "all", "always", "must")
 CORRELATION_TERMS = ("相关", "关联", "correlation", "associated")
@@ -68,6 +72,20 @@ def _is_claim_block(block: str) -> bool:
 
 def _section_presence(content_md: str, title: str) -> bool:
     return f"## {title}" in content_md
+
+
+def _split_blocks(content_md: str) -> list[str]:
+    """Canonical block splitting shared by review and revise.
+
+    Both sides MUST use this exact function so ``paragraph-N`` locations
+    emitted by the reviewers map onto the same blocks in ``revise_draft``.
+    """
+    return [block.strip() for block in content_md.split("\n\n") if block.strip()]
+
+
+def _snippet_key(text: str) -> str:
+    """Whitespace-insensitive matching key for LLM-provided claim snippets."""
+    return re.sub(r"\s+", "", text)
 
 
 def _style_issues(content_md: str, article_type: str | None) -> list[dict[str, Any]]:
@@ -211,10 +229,11 @@ def review_draft_with_metrics(
     issues: list[dict[str, Any]] = []
 
     evidence_map = {str(card.get("id")): card for card in evidence_cards if card.get("id")}
-    blocks = [block.strip() for block in content_md.split("\n\n") if block.strip()]
+    blocks = _split_blocks(content_md)
 
     total_claims = 0
     supported_claims = 0
+    knowledge_claims = 0
     unsupported_claims = 0
     unresolved_citations = 0
     total_cited_ids = 0
@@ -226,6 +245,14 @@ def review_draft_with_metrics(
 
         total_claims += 1
         evidence_ids = _parse_evidence_ids(block)
+
+        if evidence_ids == [KNOWLEDGE_MARKER]:
+            # Honest-mode knowledge paragraph: it can never carry a real
+            # evidence id, so gating it as "unsupported" would flag the same
+            # high issue every round and the revision loop could never
+            # converge. Count separately instead.
+            knowledge_claims += 1
+            continue
 
         if not evidence_ids:
             unsupported_claims += 1
@@ -244,7 +271,7 @@ def review_draft_with_metrics(
             continue
 
         total_cited_ids += len(evidence_ids)
-        unknown = [item for item in evidence_ids if item not in evidence_map]
+        unknown = [item for item in evidence_ids if item != KNOWLEDGE_MARKER and item not in evidence_map]
         if unknown:
             unresolved_citations += len(unknown)
             issues.append(
@@ -375,6 +402,7 @@ def review_draft_with_metrics(
         "overall_score": round(overall, 3),
         "critical_issues": critical_issues,
         "unsupported_claims": unsupported_claims,
+        "knowledge_claims": knowledge_claims,
         "unresolved_citations": unresolved_citations,
         "evidence_coverage": round(evidence_coverage, 3),
         "citation_validity": round(max(0.0, citation_validity), 3),
@@ -397,10 +425,28 @@ def review_draft(content_md: str, evidence_cards: list[dict[str, Any]]) -> list[
 
 def _llm_revise_paragraph(paragraph: str, issues: list[dict[str, Any]]) -> str:
     """Ask LLM to revise a single paragraph based on review issues."""
-    issues_text = "\n".join(
-        f"- [{i.get('issue_type')}] {i.get('description')}（建议：{i.get('suggestion')}）"
-        for i in issues
-    )
+    # Surface the full review context: severity, the offending text
+    # (claim), and the linked evidence ids -- not just a bare type label.
+    # Without this the reviser cannot tell what to actually fix.
+    lines: list[str] = []
+    for i in issues:
+        sev = str(i.get("severity") or "").strip()
+        head = f"[{sev}/{i.get('issue_type')}]" if sev else f"[{i.get('issue_type')}]"
+        desc = i.get("description") or "（未给出问题描述）"
+        sug = i.get("suggestion") or ""
+        line = f"- {head} {desc}"
+        if sug:
+            line += f"（建议：{sug}）"
+        claim = str(i.get("claim") or "").strip()
+        if claim:
+            line += f"\n    涉及文本：{claim[:220]}"
+        ev_ids = i.get("evidence_ids") or []
+        if ev_ids:
+            line += f"\n    关联证据 id：{', '.join(str(e) for e in ev_ids[:6])}"
+        lines.append(line)
+    issues_text = "\n".join(lines)
+
+    high_count = sum(1 for i in issues if str(i.get("severity") or "").lower() == "high")
 
     system_prompt = (
         "你是一位资深编辑，擅长根据审校意见定向修订段落。"
@@ -410,13 +456,13 @@ def _llm_revise_paragraph(paragraph: str, issues: list[dict[str, Any]]) -> str:
     )
 
     user_prompt = (
-        f"请根据以下审校意见，修订对应段落。\n\n"
+        f"请根据以下审校意见，逐条修订对应段落。\n\n"
         f"原段落：\n{paragraph}\n\n"
         f"审校意见：\n{issues_text}\n\n"
         f"修改要求：\n"
-        f"1. 解决所有审校意见指出的问题。\n"
+        f"1. 逐条解决所有审校意见指出的问题，尤其 {high_count} 条 high 级别意见必须正面回应。\n"
         f"2. 保持段落连贯性和原有风格。\n"
-        f"3. 保留 <!-- evidence: id --> 注释。\n"
+        f"3. 保留 <!-- evidence: id --> 注释；若意见指出证据 id 无效，替换为意见给出的有效 id 或删除该断言。\n"
         f"4. **保持原文长度**：不要缩减段落，修订后的字数应与原文相当。\n"
         f"5. 输出修订后的段落，不要输出其他内容。"
     )
@@ -425,20 +471,99 @@ def _llm_revise_paragraph(paragraph: str, issues: list[dict[str, Any]]) -> str:
         text = chat_completion_text(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            temperature=0.2,
             max_tokens=max(4096, len(paragraph) * 3),
             timeout=60.0,
         )
         if text:
-            return text.strip()
+            return strip_stray_llm_tags(text)
     except Exception:
         pass
     return paragraph
 
 
+def _llm_revise_global(content_md: str, issues: list[dict[str, Any]]) -> str:
+    """Whole-document revision pass for global/structural issues.
+
+    Debate reviewers emit ``location: "global"`` for structure, transition
+    and figure-text consistency findings. These are inherently cross-paragraph
+    and cannot be patched by the per-paragraph reviser, so they get one
+    dedicated full-draft pass with minimal-edit constraints.
+    """
+    lines: list[str] = []
+    for i in issues:
+        sev = str(i.get("severity") or "").strip()
+        head = f"[{sev}/{i.get('issue_type')}]" if sev else f"[{i.get('issue_type')}]"
+        desc = i.get("description") or "（未给出问题描述）"
+        sug = i.get("suggestion") or ""
+        line = f"- {head} {desc}"
+        if sug:
+            line += f"（建议：{sug}）"
+        claim = str(i.get("claim") or "").strip()
+        if claim:
+            line += f"\n    涉及文本：{claim[:220]}"
+        lines.append(line)
+    issues_text = "\n".join(lines)
+
+    system_prompt = (
+        "你是一位资深编辑，负责处理全文级审校意见（结构、衔接、图文一致性等）。"
+        "你只做意见要求的最小改动：保持所有标题、段落顺序、evidence 注释与图片标记不变，"
+        "不删减内容、不重写未涉及的部分。输出必须是修订后的完整文稿正文。"
+    )
+    user_prompt = (
+        f"请根据以下全文级审校意见修订文稿，只做必要修改。\n\n"
+        f"审校意见：\n{issues_text}\n\n"
+        f"文稿：\n{content_md}\n\n"
+        f"要求：逐条回应意见；保留所有 <!-- evidence: id --> 注释与 ![...](...) 图片行；"
+        f"保持原文长度；输出修订后的完整文稿。"
+    )
+    try:
+        text = chat_completion_text(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.2,
+            max_tokens=max(4096, len(content_md) * 2),
+            timeout=120.0,
+        )
+        if text:
+            return strip_stray_llm_tags(text)
+    except Exception:
+        pass
+    return content_md
+
+
+def _resolve_paragraph_index(
+    issue: dict[str, Any],
+    paragraph_index: int,
+    blocks: list[str],
+) -> int:
+    """Validate an issue's paragraph-N index against the block list.
+
+    LLM reviewers see the raw draft and their numbering can drift. When the
+    issue carries a claim snippet, trust the snippet over the number: if the
+    indexed block does not contain the snippet but exactly one other block
+    does, remap to that block.
+    """
+    if 1 <= paragraph_index <= len(blocks):
+        claim_key = _snippet_key(str(issue.get("claim") or ""))
+        if len(claim_key) >= 8 and claim_key not in _snippet_key(blocks[paragraph_index - 1]):
+            hits = [i for i, block in enumerate(blocks, start=1) if claim_key in _snippet_key(block)]
+            if len(hits) == 1:
+                return hits[0]
+        return paragraph_index
+    # Out-of-range index: fall back to claim-snippet lookup, else clamp.
+    claim_key = _snippet_key(str(issue.get("claim") or ""))
+    if len(claim_key) >= 8:
+        hits = [i for i, block in enumerate(blocks, start=1) if claim_key in _snippet_key(block)]
+        if len(hits) == 1:
+            return hits[0]
+    return max(1, min(paragraph_index, len(blocks))) if blocks else paragraph_index
+
+
 def revise_draft(content_md: str, issues: list[dict[str, Any]]) -> str:
-    blocks = [item for item in content_md.split("\n\n")]
-    flag_indices: set[int] = set()
+    blocks = _split_blocks(content_md)
     issues_by_paragraph: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    global_issues: list[dict[str, Any]] = []
 
     for issue in issues:
         severity = str(issue.get("severity") or "").lower()
@@ -446,50 +571,45 @@ def revise_draft(content_md: str, issues: list[dict[str, Any]]) -> str:
         location = str(issue.get("location") or "")
         match = re.fullmatch(r"paragraph-(\d+)", location)
         if not match:
+            # Structure / transition / figure-text findings are inherently
+            # cross-paragraph: route them to the whole-document pass instead
+            # of silently dropping them.
+            if location == "global" or not location:
+                global_issues.append(issue)
             continue
-        paragraph_index = int(match.group(1))
 
-        if severity == "high" and issue_type in {"evidence", "citation"}:
-            # Flag for disclaimer instead of dropping the paragraph
-            flag_indices.add(paragraph_index)
-            issues_by_paragraph[paragraph_index].append(issue)
-        else:
-            issues_by_paragraph[paragraph_index].append(issue)
+        # Both the rule layer and revise share _split_blocks + 1-based global
+        # block indexing (headings included), so paragraph-N lands on the very
+        # block the reviewer meant.
+        paragraph_index = _resolve_paragraph_index(issue, int(match.group(1)), blocks)
+
+        issues_by_paragraph[paragraph_index].append(issue)
 
     revised_blocks: list[str] = []
-    claim_counter = 0
 
-    for block in blocks:
-        text = block.strip()
-        if not text:
+    for idx, text in enumerate(blocks, start=1):
+        # Layer 1: LLM-driven targeted revision for the block the reviewers
+        # actually pointed at (any block can carry issues, not just claims).
+        para_issues = issues_by_paragraph.get(idx, [])
+        if para_issues:
+            revised_text = _llm_revise_paragraph(text, para_issues)
+            # 段落级长度守门：修订把段落砍掉一半以上时（多半是 LLM 为规避
+            # 证据问题直接删内容），保留原段。审校意见要求"删除断言"时
+            # 正常删一两句不会触发 0.5 的阈值。
+            orig_len = len(text.strip())
+            if revised_text and orig_len >= 100 and len(revised_text) < 0.5 * orig_len:
+                logger.warning(
+                    "Paragraph %d revision shrank %d -> %d chars, keeping original",
+                    idx, orig_len, len(revised_text),
+                )
+                revised_blocks.append(text)
+            else:
+                revised_blocks.append(revised_text or text)
             continue
 
-        # Use the SAME _is_claim_block logic as review_draft_with_metrics
-        # so paragraph indices align exactly.
         if not _is_claim_block(text):
             revised_blocks.append(text)
             continue
-
-        claim_counter += 1
-        if claim_counter in flag_indices:
-            # Keep the paragraph but append a disclaimer instead of dropping it
-            para_issues = issues_by_paragraph.get(claim_counter, [])
-            if para_issues:
-                revised_text = _llm_revise_paragraph(text, para_issues)
-                if revised_text:
-                    revised_blocks.append(revised_text)
-                    continue
-            # Fallback: keep original with a soft disclaimer
-            revised_blocks.append(text)
-            continue
-
-        # Layer 1: LLM-driven targeted revision for fact/logic/expression issues
-        para_issues = issues_by_paragraph.get(claim_counter, [])
-        if para_issues:
-            revised_text = _llm_revise_paragraph(text, para_issues)
-            if revised_text:
-                revised_blocks.append(revised_text)
-                continue
 
         # Layer 0 fallback: naive string replacements
         cleaned = text.replace("[evidence:REPLACE_ME]", "")
@@ -501,6 +621,30 @@ def revise_draft(content_md: str, issues: list[dict[str, Any]]) -> str:
         revised_blocks.append(cleaned)
 
     revised = "\n\n".join(revised_blocks).strip()
+
+    if global_issues and revised:
+        global_revised = _llm_revise_global(revised, global_issues)
+        # 全文级修订同样受长度守门：输出被 max_tokens 截断（句中截断）或
+        # 大幅删减时，保留修订前的版本。
+        if len(global_revised) < 0.7 * len(revised):
+            logger.warning(
+                "Global revision shrank draft %d -> %d chars (<70%%), keeping pre-global version",
+                len(revised), len(global_revised),
+            )
+        else:
+            revised = global_revised
+
+    # 文档级长度守门：证据饥饿时修订 LLM 会整节删内容换指标（段落少了、
+    # unsupported claims 少了、分数反而升高），导致成稿被砍半还带着
+    # 截断句。修订稿掉到原文 70% 以下时整体拒绝，保留原稿交由
+    # revise_node 的回滚逻辑处理。
+    original_len = len(content_md.strip())
+    if original_len >= 500 and len(revised) < 0.7 * original_len:
+        logger.warning(
+            "Revision shrank draft %d -> %d chars (<70%%), rejecting revision to preserve content",
+            original_len, len(revised),
+        )
+        return content_md
 
     if not revised:
         revised = "# 修订稿\n\n当前版本因证据门禁未通过，已移除不合规段落，请补充 evidence cards 后重新生成。"
@@ -547,10 +691,11 @@ def debate_review_with_metrics(
     issues: list[dict[str, Any]] = []
 
     evidence_map = {str(card.get("id")): card for card in evidence_cards if card.get("id")}
-    blocks = [block.strip() for block in content_md.split("\n\n") if block.strip()]
+    blocks = _split_blocks(content_md)
 
     total_claims = 0
     supported_claims = 0
+    knowledge_claims = 0
     unsupported_claims = 0
     unresolved_citations = 0
     total_cited_ids = 0
@@ -562,6 +707,14 @@ def debate_review_with_metrics(
 
         total_claims += 1
         evidence_ids = _parse_evidence_ids(block)
+
+        if evidence_ids == [KNOWLEDGE_MARKER]:
+            # Honest-mode knowledge paragraph: it can never carry a real
+            # evidence id, so gating it as "unsupported" would flag the same
+            # high issue every round and the revision loop could never
+            # converge. Count separately instead.
+            knowledge_claims += 1
+            continue
 
         if not evidence_ids:
             unsupported_claims += 1
@@ -580,7 +733,7 @@ def debate_review_with_metrics(
             continue
 
         total_cited_ids += len(evidence_ids)
-        unknown = [item for item in evidence_ids if item not in evidence_map]
+        unknown = [item for item in evidence_ids if item != KNOWLEDGE_MARKER and item not in evidence_map]
         if unknown:
             unresolved_citations += len(unknown)
             issues.append(
@@ -699,6 +852,9 @@ def debate_review_with_metrics(
         and citation_validity >= 0.90
         and logic_score >= 0.80
         and style_score >= 0.80
+        # 批次8: the debate reviewers only saw a prefix of an over-length
+        # draft - the unreviewed tail cannot support a publication verdict.
+        and not debate_result.truncated
     )
 
     overall = max(
@@ -716,6 +872,7 @@ def debate_review_with_metrics(
         "overall_score": round(overall, 3),
         "critical_issues": critical_issues,
         "unsupported_claims": unsupported_claims,
+        "knowledge_claims": knowledge_claims,
         "unresolved_citations": unresolved_citations,
         "evidence_coverage": round(evidence_coverage, 3),
         "citation_validity": round(max(0.0, citation_validity), 3),
@@ -726,6 +883,7 @@ def debate_review_with_metrics(
         **fact_metrics,
         "human_review_required": True,
         "publication_prepared": publication_prepared,
+        "debate_truncated": bool(debate_result.truncated),
         "debate_review_issues": len(debate_issues),
         "debate_consensus_count": len(debate_result.consensus_issues),
         "debate_disputed_count": len(debate_result.disputed_issues),

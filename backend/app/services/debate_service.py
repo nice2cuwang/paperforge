@@ -57,6 +57,10 @@ class DebateResult:
     disputed_issues: list[dict[str, Any]] = field(default_factory=list)
     agent_opinions: list[dict[str, Any]] = field(default_factory=list)
     debate_log: list[dict[str, Any]] = field(default_factory=list)
+    # True when the draft exceeded MAX_CONTENT_LENGTH and the reviewers only
+    # saw a prefix - downstream quality gates must not certify the unreviewed
+    # tail (批次8).
+    truncated: bool = False
 
 
 @dataclass
@@ -129,6 +133,9 @@ def _build_evidence_brief(
         support = str(card.get("supporting_text") or "")[:600]
         strength = str(card.get("strength") or "unknown").lower()
         ev_type = str(card.get("evidence_type") or "general")
+        # S4: cards tagged with a conflict group are shown to the reviewer so
+        # drafts that cite both sides without comparing them get flagged.
+        conflict_group = str(card.get("conflict_group") or "")
 
         if strength in {"high", "medium"}:
             strong += 1
@@ -141,6 +148,7 @@ def _build_evidence_brief(
             "supporting_text": support,
             "strength": strength,
             "evidence_type": ev_type,
+            "conflict_group": conflict_group,
             "_has_support": len(support) > 40 and support != claim,
             "_support_excerpt": support[:200] if support else "",
         })
@@ -164,7 +172,8 @@ def _format_evidence_for_reviewer(brief: _EvidenceBrief) -> str:
         cid = card["id"]
         strength = card["strength"]
         claim = card["claim"]
-        lines.append(f"[EV-{cid}] type={card['evidence_type']}, strength={strength}")
+        tag = f", conflict_group={card['conflict_group']}" if card.get("conflict_group") else ""
+        lines.append(f"[EV-{cid}] type={card['evidence_type']}, strength={strength}{tag}")
         lines.append(f"  claim: {claim}")
         if card["_has_support"]:
             excerpt = card["_support_excerpt"]
@@ -271,7 +280,9 @@ _EVIDENCE_REVIEWER_SYSTEM = """\
 2. **证据覆盖（coverage）**：是否有核心段落缺少证据支撑？是否存在无来源的关键断言？
 3. **幻觉检测（hallucination）**：是否存在证据卡片中完全没有提及的事实、数据或结论？
 4. **证据强度匹配（calibration）**：文稿语气是否与证据强度匹配？low-strength 证据是否被用来支撑强断言？
-5. **表达质量（expression）**：术语首次出现是否附带解释？段落过渡是否自然？是否存在冗余或模糊表述？
+5. **冲突证据处理（S4）**：证据卡片中带 ``conflict_group`` 标记的卡片之间结论相互矛盾。如果文稿同时引用了同一 conflict_group 的两张及以上卡片，必须对双方结论做批判性对比（说明分歧及可能原因）；若只是并排引用而不讨论分歧、或只引用其中一方，判为 high 问题。
+6. **表达质量（expression）**：术语首次出现是否附带解释？段落过渡是否自然？是否存在冗余或模糊表述？
+7. **图文一致性（figure-text consistency, L3）**：文稿中的配图（``![...](...)`` 图片块及其下方 ``**图N：**`` 图注）必须与其所在段落的内容一致。检查：① 正文引用图片（如"如图N所示"）时，该图确实存在于正文中且图号对应正确；② 图注中的数据/结论与所在节正文的数据/结论一致（图注说的是提升 30%，正文不能写提升 50%）；③ 图注与图表内容一致（若图表与图注都在正文中出现，二者描述应吻合）。发现矛盾判为 high 问题（issue_type 用 ``figure``），发现引用悬空（正文提"如图N所示"但无对应图片块）或图注与正文数据轻微不一致判为 medium。
 
 ## 审查方法
 
@@ -297,7 +308,7 @@ _EVIDENCE_REVIEWER_SYSTEM = """\
   "issues": [
     {
       "severity": "high|medium|low",
-      "issue_type": "evidence|fact|expression",
+      "issue_type": "evidence|fact|figure|expression",
       "location": "paragraph-N|global",
       "claim": "文稿中的具体文本片段",
       "description": "问题描述：为什么这是一个问题，涉及哪些证据卡",
@@ -702,6 +713,11 @@ def _truncate(content_md: str) -> str:
     return content_md
 
 
+def is_truncated(content_md: str) -> bool:
+    """Whether the debate reviewers would only see a prefix of this draft."""
+    return len(content_md or "") > MAX_CONTENT_LENGTH
+
+
 def _format_reviewer_findings(
     evidence_issues: list[dict[str, Any]],
     logic_issues: list[dict[str, Any]],
@@ -752,6 +768,7 @@ def debate_review(
 
     Returns ``DebateResult`` (backward-compatible with v1).
     """
+    truncated = is_truncated(content_md)
     content_md = _truncate(content_md)
 
     # ── Real-time task logging helper ──
@@ -799,6 +816,7 @@ def debate_review(
             issues=ev_issues,
             agent_opinions=[{"role": "evidence_reviewer", "issue_count": len(ev_issues)}],
             debate_log=debate_log,
+            truncated=truncated,
         )
 
     # ── Lite: dual reviewer, no challenger, no cross-review ──
@@ -834,6 +852,7 @@ def debate_review(
                 {"role": "logic_reviewer", "issue_count": len(logic_issues)},
             ],
             debate_log=debate_log,
+            truncated=truncated,
         )
 
     # ── Full: dual reviewer + challenger + cross-review ──
@@ -977,4 +996,5 @@ def debate_review(
             {"role": "challenger", "issue_count": len(challenge_issues)},
         ],
         debate_log=debate_log,
+        truncated=truncated,
     )

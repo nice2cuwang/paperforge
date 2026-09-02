@@ -7,7 +7,9 @@ Each node reads/updates WorkflowState and handles its own errors.
 from __future__ import annotations
 
 import logging
+import re
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 from uuid import uuid4
@@ -35,7 +37,7 @@ from app.services.review_service import (
     revise_draft,
     score_quality,
 )
-from app.services.task_registry import add_log, set_progress
+from app.services.task_registry import add_log, set_artifact, set_progress
 from app.services.workflow.helpers import (
     _evidence_to_dict,
     _get_project_or_404,
@@ -59,8 +61,17 @@ from app.services.workflow.search_select import (
     _text_query_score,
     run_search_and_select,
 )
-from app.services.writing_service import build_draft_markdown
-from app.services.web_search_service import search_web, fetch_page_text, build_web_evidence
+from app.services.writing_service import (
+    build_draft_markdown,
+    build_thesis_statement,
+    plan_article_sections,
+    strip_evidence_comments,
+)
+from app.services.web_search_service import (
+    build_web_evidence,
+    fetch_page_details,
+    search_web,
+)
 from app.services.community_service import (
     search_reddit,
     search_zhihu,
@@ -113,10 +124,22 @@ class WorkflowState(TypedDict, total=False):
     llm_knowledge_count: int
     cards: list[EvidenceCard]
 
+    # Conflict detection (S4)
+    conflict_groups: list[dict[str, Any]]
+
+    # Search quality signal: True when no selected paper is topically
+    # relevant (authority-only scores let same-keyword noise through).
+    papers_off_topic: bool
+
     # Draft
     draft: Draft | None
     current_content: str
     draft_sections: list[str]
+    thesis_statement: str
+    figure_plans: list[dict[str, Any]]
+    # L2: per-figure evidence dependency (path/section/evidence_ids) so the
+    # revise loop can re-sync captions when a section's evidence changes.
+    figure_deps: list[dict[str, Any]]
 
     # Review / revision loop
     current_issues: list[dict[str, Any]]
@@ -252,21 +275,37 @@ def search_node(state: WorkflowState) -> dict[str, Any]:
 
     if not selected_papers:
         provider_diag = _provider_diagnostics()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": "SEARCH_NO_CANDIDATES",
-                "title": "No credible papers found from current search",
-                "message": "Current query returned no usable real candidates.",
-                "summary": {"query": query, "provider_candidate_count": 0, "inserted_count": inserted},
-                "provider_diagnostics": provider_diag,
-                "next_actions": [
-                    "Check backend network connectivity to OpenAlex/Crossref/arXiv.",
-                    "If you use a local proxy, set PAPERFORGE_PROXY_URL.",
-                    "If you already selected trusted local papers, run with keep_manual_selection=true.",
-                ],
-            },
+        add_log(
+            task_id,
+            f"WARNING: no academic papers selected from {inserted} candidates. "
+            f"Workflow will continue with web/community sources only. "
+            f"Provider diagnostics: {provider_diag}"
         )
+
+    # ── Off-topic pool detection ─────────────────────────────────
+    # relevance_score encodes authority (citations + recency), not topical
+    # fit: a query with no real academic hits ("DeepSeek Harness") still
+    # fills the pool with same-keyword journal noise. Flag the pool so the
+    # figure pipeline stops broadcasting off-topic papers' figures/titles.
+    #
+    # 判定标准：多数派（≥60% 命中）才算论文池对口。此前只要 1 篇标题
+    # 命中 ≥2 个查询词就整池放行，擦边池（1/12 命中）照样把离题图表
+    # 灌进正文。
+    papers_off_topic = False
+    if selected_papers:
+        from app.services.search_service import title_query_hits
+
+        topical = [p for p in selected_papers if title_query_hits(p.title or "", query) >= 2]
+        topical_ratio = len(topical) / len(selected_papers)
+        if not topical or topical_ratio < 0.6:
+            papers_off_topic = True
+            add_log(
+                task_id,
+                f"WARNING: only {len(topical)}/{len(selected_papers)} selected papers share >=2 "
+                f"content terms with the query (ratio {topical_ratio:.0%} < 60%) - the academic "
+                f"pool is mostly off-topic noise. Paper figures and social proof cards will be "
+                f"skipped; the article will lean on web/community evidence instead."
+            )
 
     return {
         "query": query,
@@ -277,6 +316,7 @@ def search_node(state: WorkflowState) -> dict[str, Any]:
         "paper_diagnostics": [],
         "rewritten_queries": rewritten_queries,
         "required_terms": required_terms,
+        "papers_off_topic": papers_off_topic,
     }
 
 
@@ -429,6 +469,28 @@ def evidence_node(state: WorkflowState) -> dict[str, Any]:
     low_rel_count = 0
     query_tokens = _query_tokens(query)
 
+    # ── Hybrid recall (批次7): one project-wide vector pass over Qdrant ──
+    # Chunks ingested earlier are already embedded in Qdrant, but the per-paper
+    # selection below was purely lexical (token overlap): semantically close
+    # chunks that share no query vocabulary could never pass the lexical gate.
+    # The vector ranks both rescue those chunks and order the survivors.
+    vector_ranks: dict[str, int] = {}
+    vector_by_paper: dict[str, list[str]] = defaultdict(list)
+    try:
+        from app.services.retrieval_service import recall_chunks
+
+        for rank, hit in enumerate(recall_chunks(query, project_id=state["project_id"], top_k=120)):
+            cid = str(hit.get("id") or "")
+            if not cid:
+                continue
+            vector_ranks[cid] = rank
+            pid = str(hit.get("paper_id") or "")
+            if pid:
+                vector_by_paper[pid].append(cid)
+        add_log(task_id, f"vector recall: {len(vector_ranks)} chunks ranked across {len(vector_by_paper)} papers")
+    except Exception as exc:
+        add_log(task_id, f"vector recall unavailable ({type(exc).__name__}); lexical scoring only")
+
     for paper in papers:
         chunks = list(
             db.scalars(select(PaperChunk).where(PaperChunk.paper_id == paper.id).order_by(PaperChunk.created_at)).all()
@@ -440,6 +502,7 @@ def evidence_node(state: WorkflowState) -> dict[str, Any]:
             {"id": c.id, "text": c.text, "page_start": c.page_start, "page_end": c.page_end}
             for c in chunks
         ]
+        payload_by_id = {str(c["id"]): c for c in chunk_payloads}
         scored = [(_text_query_score(c["text"], query), c) for c in chunk_payloads]
         max_score = max((s for s, _ in scored), default=0.0)
         if query_tokens:
@@ -456,6 +519,24 @@ def evidence_node(state: WorkflowState) -> dict[str, Any]:
             threshold = max(0.06, max_score * 0.4)
             filtered = [c for s, c in scored if s >= threshold]
             chunk_payloads = filtered if filtered else [c for _, c in sorted(scored, key=lambda r: r[0], reverse=True)[:8]]
+
+        # Merge in vector-recalled chunks of this paper that the lexical gate
+        # dropped, then order everything by semantic closeness (vector rank
+        # first, lexical score as tiebreaker for unranked chunks).
+        recall_ids = [cid for cid in vector_by_paper.get(paper.id, []) if cid in payload_by_id]
+        if vector_ranks and (recall_ids or chunk_payloads):
+            merged: dict[str, dict[str, Any]] = {str(c["id"]): c for c in chunk_payloads}
+            for cid in recall_ids[:6]:
+                merged.setdefault(cid, payload_by_id[cid])
+            lexical_scores = {str(c["id"]): s for s, c in scored}
+
+            def _order(chunk: dict[str, Any]) -> tuple[int, Any]:
+                cid = str(chunk["id"])
+                if cid in vector_ranks:
+                    return (0, vector_ranks[cid])
+                return (1, -lexical_scores.get(cid, 0.0))
+
+            chunk_payloads = sorted(merged.values(), key=_order)
 
         for item in build_evidence_from_chunks(paper.id, chunk_payloads, limit=payload.max_cards):
             if ev_count >= payload.max_cards:
@@ -494,7 +575,7 @@ def evidence_node(state: WorkflowState) -> dict[str, Any]:
                 db.add(EvidenceCard(
                     id=str(uuid4()), project_id=state["project_id"], paper_id=paper.id,
                     chunk_ids=[], claim=item["claim"], supporting_text=item["supporting_text"],
-                    evidence_type=item["evidence_type"], strength="low",
+                    evidence_type=item["evidence_type"], source_type="academic", strength="low",
                     limitations="Metadata-only evidence (title/abstract). Full PDF unavailable.",
                     page_start=None, page_end=None, citation_key=item["citation_key"],
                     used_in_draft=False, created_at=_now(), updated_at=_now(),
@@ -512,20 +593,15 @@ def evidence_node(state: WorkflowState) -> dict[str, Any]:
             {"title": d.get("title"), "error": d.get("error")}
             for d in state["paper_diagnostics"] if d.get("status") == "failed"
         ][:6]
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={
-            "code": "NO_EVIDENCE_CARDS", "title": "No evidence cards were generated",
-            "message": "All selected papers were skipped or failed before parsing.",
-            "summary": {
-                "selected_count": len(papers), "reused_local_pdf_count": state["reused_local_pdf_count"],
-                "downloaded_count": state["downloaded_count"], "parsed_count": state["parsed_count"],
-                "skipped_no_pdf_count": state["skipped_no_pdf_count"], "failed_count": state["failed_count"],
-                "evidence_count": 0, "metadata_fallback_evidence_count": 0,
-                "low_relevance_filtered_count": low_rel_count,
-            },
-            "skipped_titles": skipped_titles, "failed_items": failed_items,
-            "next_actions": ["Upload a local PDF or refine the search query."],
-            "paper_diagnostics": state["paper_diagnostics"][:20],
-        })
+        add_log(
+            task_id,
+            f"WARNING: no academic evidence cards generated. "
+            f"selected={len(papers)}, reused={state['reused_local_pdf_count']}, "
+            f"downloaded={state['downloaded_count']}, parsed={state['parsed_count']}, "
+            f"skipped={state['skipped_no_pdf_count']}, failed={state['failed_count']}. "
+            f"Workflow will continue with web/community sources. "
+            f"skipped_titles={skipped_titles}, failed_items={failed_items}"
+        )
 
     cards = list(db.scalars(select(EvidenceCard).where(EvidenceCard.project_id == state["project_id"])).all())
     add_log(task_id, f"evidence cards built: {len(cards)}")
@@ -543,6 +619,8 @@ def evidence_node(state: WorkflowState) -> dict[str, Any]:
 
 def web_sources_node(state: WorkflowState) -> dict[str, Any]:
     """Search the web for additional evidence beyond academic papers."""
+    from datetime import datetime as _dt
+
     task_id = state["task_id"]
     db = state["db"]
     project = state["project"]
@@ -552,19 +630,44 @@ def web_sources_node(state: WorkflowState) -> dict[str, Any]:
     add_log(task_id, "langgraph: gather_web_sources")
     set_progress(task_id, 68, "searching web sources")
 
+    # web 优先（时效话题）：扩大检索面 — 更多查询变体、更多结果、多抓页面
+    web_priority = bool((state.get("topic_assessment") or {}).get("web_priority_effective"))
+    max_per_query = 12 if web_priority else 8
+    max_page_fetches = 18 if web_priority else 12
+
     web_count = 0
     try:
         # Build web search queries: use original query + rewritten queries for product-specific searches
-        web_queries = [query]
-        for rq in rewritten_queries[:3]:
+        # 查询-时效配对：web 优先的时效话题核心查询限 1 个月、新闻变体限 1 周，
+        # 重写查询不限时（保留背景资料入口）。不限时的旧路径不受影响。
+        query_plan: list[tuple[str, str | None]] = [(query, "month" if web_priority else None)]
+        for rq in rewritten_queries[: (5 if web_priority else 3)]:
             if rq.lower() != query.lower():
-                web_queries.append(rq)
-        add_log(task_id, f"web search queries: {web_queries}")
+                query_plan.append((rq, None))
+
+        # Add a year-tagged variant for news / recent-event topics
+        current_year = str(_dt.now().year)
+        if current_year not in query:
+            query_plan.append((f"{query} {current_year}", None))
+
+        # web 优先时追加"最新/新闻"变体，并限定最近一周
+        if web_priority:
+            existing = {q.lower() for q, _ in query_plan}
+            for suffix in ("最新 消息", "news"):
+                variant = f"{query} {suffix}"
+                if variant.lower() not in existing:
+                    query_plan.append((variant, "week"))
+
+        add_log(
+            task_id,
+            f"web search queries (web_priority={web_priority}): "
+            + "; ".join(f"{q!r}[recency={r}]" for q, r in query_plan),
+        )
 
         all_web_results: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
-        for wq in web_queries:
-            results = search_web(wq, max_results=8)
+        for wq, recency in query_plan:
+            results = search_web(wq, max_results=max_per_query, recency=recency)
             for r in results:
                 url = r.get("url", "")
                 if url and url not in seen_urls:
@@ -572,13 +675,23 @@ def web_sources_node(state: WorkflowState) -> dict[str, Any]:
                     all_web_results.append(r)
         add_log(task_id, f"web search returned {len(all_web_results)} total results (deduped)")
 
+        # 抓取预算优先花在最新发布的源上（published 未知者排后）
+        def _freshness_key(r: dict[str, Any]) -> str:
+            return r.get("published") or "0000-00-00"
+
+        by_freshness = sorted(all_web_results, key=_freshness_key, reverse=True)
+
         # Fetch page text for top results (limit to avoid timeout)
-        for result in all_web_results[:8]:
+        for result in by_freshness[:max_page_fetches]:
             url = result.get("url", "")
             if url:
-                text = fetch_page_text(url)
+                details = fetch_page_details(url)
+                text = details.get("text")
                 if text and len(text) > 100:
                     result["full_text"] = text
+                # 页面 meta 的发布时间比 snippet 猜测可靠，优先覆盖
+                if details.get("published"):
+                    result["published"] = details["published"]
 
         # Build evidence from web results
         web_evidence = build_web_evidence(state["project_id"], all_web_results, db)
@@ -627,9 +740,16 @@ def community_sources_node(state: WorkflowState) -> dict[str, Any]:
         # Generate LLM knowledge — scale depth based on existing evidence count
         existing_count = state.get("evidence_count", 0) + community_count
         # Check how many existing cards are actually relevant (have source_type set)
-        topic_type = state.get("topic_assessment", {}).get("topic_type", "general")
+        topic_assessment = state.get("topic_assessment", {})
+        topic_type = topic_assessment.get("topic_type", "general")
+        # web 优先（时效话题）时论文只作背景，模型知识是正文主力之一 → 加深
+        web_priority_effective = bool(topic_assessment.get("web_priority_effective"))
         # For product-type topics or sparse evidence, generate more LLM knowledge
-        knowledge_depth = "deep" if (existing_count < 8 or topic_type == "product") else "standard"
+        knowledge_depth = (
+            "deep"
+            if (existing_count < 8 or topic_type == "product" or web_priority_effective)
+            else "standard"
+        )
         llm_results = generate_llm_knowledge(
             project.title, project.research_question, existing_count,
             depth=knowledge_depth,
@@ -705,6 +825,11 @@ def relevance_filter_node(state: WorkflowState) -> dict[str, Any]:
         "- 直接相关：证据内容直接讨论了研究问题的核心主题\n"
         "- 间接相关：证据涉及研究问题的某个侧面或提供了有用的背景\n"
         "- 不相关：证据内容与研究问题的核心主题没有实质联系\n\n"
+        "来源可信度分级（S3）：academic=学术论文 1.0，web=网络来源 0.5，"
+        "community=社区讨论 0.3，llm_knowledge=背景知识 0.2。\n"
+        "- 低可信度来源（web/community/llm_knowledge）必须从严把关："
+        "只有直接支撑研究问题核心主张的内容才算 relevant，边缘相关的判为 irrelevant\n"
+        "- 学术来源可放宽：间接相关即可判为 relevant\n\n"
         "请对每条证据卡输出 relevant（直接或间接相关）或 irrelevant（不相关）。"
     )
 
@@ -744,26 +869,79 @@ def relevance_filter_node(state: WorkflowState) -> dict[str, Any]:
 
             add_log(task_id, f"relevance filter: {len(relevant_indices)}/{len(cards)} cards passed")
     except Exception:
-        logger.exception("Relevance filter LLM call failed, keeping all cards")
-        add_log(task_id, "relevance filter failed (non-fatal), keeping all cards")
-        return {"cards": cards, "low_relevance_filtered_count": 0}
+        logger.exception("Relevance filter LLM call failed")
+        add_log(task_id, "relevance filter LLM failed, using keyword fallback")
+        # ── Keyword-based fallback ───────────────────────────────────────
+        # Extract key terms from the research question and filter cards
+        # that contain at least one meaningful keyword match.
+        import re as _re
+        topic_terms = [
+            t.lower() for t in _re.split(r'[\s,，。？！、""''（）]+', query)
+            if len(t) >= 2 and t.lower() not in {
+                "the", "and", "for", "with", "from", "that", "this",
+                "what", "how", "why", "which", "关于", "的", "了", "是",
+                "在", "有", "和", "与", "对", "为", "从", "等",
+            }
+        ]
+        # Also add project title terms
+        for t in _re.split(r'[\s,，。？！、""''（）]+', project.title or ""):
+            if len(t) >= 2:
+                topic_terms.append(t.lower())
+        topic_terms = list(set(topic_terms))
+
+        if topic_terms:
+            from app.services.evidence_service import credibility_weight
+
+            for i, card in enumerate(cards):
+                text = ((card.claim or "") + " " + (card.supporting_text or "")).lower()
+                hits = sum(1 for term in topic_terms if term in text)
+                # S3: low-credibility sources need stronger evidence of relevance.
+                cred = credibility_weight(card.source_type, bool(getattr(card, "paper", None) and card.paper.doi))
+                min_hits = 1 if cred >= 0.5 else 2
+                if hits >= min_hits:
+                    relevant_indices.add(i)
+            add_log(task_id, f"keyword fallback: {len(relevant_indices)}/{len(cards)} cards matched terms={topic_terms[:8]}")
+        else:
+            add_log(task_id, "keyword fallback: no meaningful terms extracted, keeping all cards")
+            relevant_indices = set(range(len(cards)))
 
     if not relevant_indices:
-        add_log(task_id, "relevance filter rejected all cards — keeping top 3 by source_type diversity")
-        # Fallback: keep at least a few cards to avoid empty article
-        # Prioritize cards with source_type != None (multi-source evidence)
-        prioritized = sorted(
-            range(len(cards)),
-            key=lambda i: (
-                1 if cards[i].source_type else 0,
-                i,
-            ),
-            reverse=True,
-        )[:3]
-        relevant_indices = set(prioritized)
+        add_log(task_id, "relevance filter rejected all cards — using keyword fallback to keep best matches")
+        # Fallback: keyword-based scoring to keep the most relevant cards
+        import re as _re
+        topic_terms = [
+            t.lower() for t in _re.split(r'[\s,，。？！、""''（）]+', (query or "") + " " + (project.title or ""))
+            if len(t) >= 2 and t.lower() not in {
+                "the", "and", "for", "with", "from", "that", "this",
+                "what", "how", "why", "which", "关于", "的", "了", "是",
+                "在", "有", "和", "与", "对", "为", "从", "等",
+            }
+        ]
+        scored: list[tuple[int, int]] = []
+        for i, card in enumerate(cards):
+            text = ((card.claim or "") + " " + (card.supporting_text or "")).lower()
+            hits = sum(1 for term in topic_terms if term in text)
+            scored.append((hits, i))
+        scored.sort(reverse=True)
+        # Keep top 5 scoring cards (or fewer if fewer exist)
+        relevant_indices = set(idx for _, idx in scored[:min(5, len(scored))] if _ > 0)
+        if not relevant_indices:
+            # Last resort: keep top 3 by position
+            relevant_indices = set(idx for _, idx in scored[:min(3, len(scored))])
 
     filtered_cards = [cards[i] for i in sorted(relevant_indices)]
     filtered_count = len(cards) - len(filtered_cards)
+
+    # ── Cross-card dedup (批次7) ──
+    # The same finding restated by several chunks/papers enters the pool as
+    # multiple cards and crowds out diverse evidence under the per-section
+    # bucket cap; merge near-duplicates before writing.
+    from app.services.evidence_service import dedupe_evidence_cards
+
+    filtered_cards, deduped_count = dedupe_evidence_cards(filtered_cards)
+    if deduped_count:
+        add_log(task_id, f"dedup: dropped {deduped_count} near-duplicate evidence cards")
+        filtered_count += deduped_count
 
     if filtered_count > 0:
         add_log(task_id, f"relevance filter removed {filtered_count} irrelevant cards")
@@ -772,6 +950,39 @@ def relevance_filter_node(state: WorkflowState) -> dict[str, Any]:
         "cards": filtered_cards,
         "low_relevance_filtered_count": state.get("low_relevance_filtered_count", 0) + filtered_count,
     }
+
+
+# ── Node 3d: conflict_detection (S4) ────────────────────────────
+
+
+def conflict_detection_node(state: WorkflowState) -> dict[str, Any]:
+    """Group evidence claims that contradict each other (S4).
+
+    Runs right after relevance filtering. Conflicting cards are grouped by
+    ``group_id``; the writing prompt then forces critical comparison instead
+    of picking one side, and the reviewer flags drafts that cite both sides
+    without discussing the conflict.
+    """
+    task_id = state["task_id"]
+    project = state["project"]
+    cards = state.get("cards", [])
+
+    set_progress(task_id, 75, "detecting conflicting evidence")
+    from app.services.evidence_service import detect_conflict_groups
+
+    groups = detect_conflict_groups(
+        cards=[_evidence_to_dict(c) for c in cards],
+        research_question=project.research_question or project.title,
+    )
+    if groups:
+        add_log(
+            task_id,
+            "conflict groups: "
+            + "; ".join(f"{g['group_id']}({', '.join(g['card_ids'])})" for g in groups),
+        )
+    else:
+        add_log(task_id, "conflict detection: no conflicting evidence found")
+    return {"conflict_groups": groups}
 
 
 # ── Node 3e: topic_feasibility_assessment ───────────────────────
@@ -812,7 +1023,8 @@ def topic_assessment_node(state: WorkflowState) -> dict[str, Any]:
         f"- academic: 学术理论或方法\n"
         f"- policy: 政策分析或社会治理\n"
         f"- general: 通用知识话题\n\n"
-        f"web_priority: 如果是产品类话题（最新信息在网页而非论文中），设为 true。\n\n"
+        f"web_priority: 如果该话题具有强时效性（新闻事件、产品发布/更新、价格变动、"
+        f"行业动态等——最新信息主要存在于网页/新闻而非学术论文中），设为 true。\n\n"
         f"只输出 JSON，不要输出其他内容。"
     )
 
@@ -847,10 +1059,27 @@ def topic_assessment_node(state: WorkflowState) -> dict[str, Any]:
     topic_type = assessment.get("topic_type", "general")
     web_priority = assessment.get("web_priority", False)
 
-    add_log(task_id, f"topic assessment: feasibility={feasibility}, type={topic_type}, web_priority={web_priority}")
+    # ── 双保险证据策略（时效话题）─────────────────────────────────
+    # 话题评估判定时效性，或文章类型本身就是公众号文章（天然时效导向），
+    # 都切换为 web 优先：web/社区证据作正文主力，论文只作背景参考。
+    web_priority_effective = bool(web_priority or project.article_type == "wechat_article")
+    assessment["web_priority_effective"] = web_priority_effective
+
+    add_log(
+        task_id,
+        f"topic assessment: feasibility={feasibility}, type={topic_type}, "
+        f"web_priority={web_priority}, web_priority_effective={web_priority_effective}",
+    )
 
     if feasibility == "low":
         add_log(task_id, f"WARNING: topic '{query[:50]}' assessed as low feasibility — limited public material available")
+
+    if web_priority_effective:
+        add_log(
+            task_id,
+            "evidence strategy: WEB PRIORITY — web/community sources lead the body; "
+            "academic papers are demoted to background references",
+        )
 
     return {
         "topic_assessment": assessment,
@@ -874,6 +1103,11 @@ def draft_node(state: WorkflowState) -> dict[str, Any]:
         article_type=project.article_type,
         citation_style=project.citation_style,
         evidence_cards=[_evidence_to_dict(c) for c in cards],
+        thesis_statement=state.get("thesis_statement", ""),
+        sections=state.get("draft_sections") or None,
+        figure_plans=state.get("figure_plans") or None,
+        conflict_groups=state.get("conflict_groups") or None,
+        papers_off_topic=bool(state.get("papers_off_topic", False)),
     )
     draft = Draft(
         id=str(uuid4()),
@@ -887,11 +1121,80 @@ def draft_node(state: WorkflowState) -> dict[str, Any]:
     )
     db.add(draft)
     db.flush()
+    # 增量提交：草稿一旦生成立即落盘，进程被杀也能从 drafts 表取回。
+    draft_id, draft_version = draft.id, draft.version
+    db.commit()
+    set_artifact(task_id, "draft_id", draft_id)
+    set_artifact(task_id, "draft_version", draft_version)
     add_log(task_id, f"draft generated with {len(draft_sections)} topic-specific sections: {draft_sections}")
     return {"draft": draft, "current_content": draft.content_md, "draft_sections": draft_sections}
 
 
-# ── Node 4b: generate_images ───────────────────────────────────
+# ── Node 4a: thesis_thread (W1) ────────────────────────────────
+
+
+def thesis_thread_node(state: WorkflowState) -> dict[str, Any]:
+    """Distill the article's argument line before drafting (W1).
+
+    Produces a 3-5 sentence thesis (core claim + evidence pillars + expected
+    conclusion) that every section writes toward, so the draft reads as one
+    argument instead of stitched-together paragraphs.
+    """
+    task_id = state["task_id"]
+    project = state["project"]
+    payload = state["payload"]
+    cards = state.get("cards", [])
+
+    set_progress(task_id, 77, "distilling thesis thread")
+    thesis = build_thesis_statement(
+        project_title=payload.draft_title or project.title,
+        research_question=project.research_question,
+        article_type=project.article_type,
+        evidence_cards=[_evidence_to_dict(c) for c in cards],
+    )
+    # Section headings are also planned at outline stage (before drafting) so
+    # plan_figures (F1) and the writing prompt share one section list.
+    sections = plan_article_sections(
+        article_type=project.article_type,
+        project_title=payload.draft_title or project.title,
+        research_question=project.research_question,
+        evidence_cards=[_evidence_to_dict(c) for c in cards],
+    )
+    add_log(task_id, f"thesis thread: {thesis[:100]}")
+    return {"thesis_statement": thesis, "draft_sections": sections}
+
+
+# ── Node 4b: plan_figures (F1) ─────────────────────────────────
+
+
+def plan_figures_node(state: WorkflowState) -> dict[str, Any]:
+    """Plan which figure each section needs, grounded in real evidence (F1).
+
+    Runs at outline stage (after thesis_thread, before drafting) so the writing
+    prompt can reference planned figures via ``{{ref:fig:N}}`` placeholders and
+    image generation executes the plan instead of random placement.
+    """
+    task_id = state["task_id"]
+    sections = state.get("draft_sections") or []
+    cards = state.get("cards", [])
+
+    set_progress(task_id, 78, "planning figures per section")
+    from app.services.image_service import plan_figures
+
+    plans = plan_figures(
+        sections=sections,
+        evidence_cards=[_evidence_to_dict(c) for c in cards],
+    )
+    add_log(
+        task_id,
+        "planned "
+        + f"{len(plans)} figures: "
+        + "; ".join(f"fig{p['fig_index']}->{p['section'][:14]}" for p in plans),
+    )
+    return {"figure_plans": plans}
+
+
+# ── Node 4c: generate_images ───────────────────────────────────
 
 
 def image_generation_node(state: WorkflowState) -> dict[str, Any]:
@@ -914,21 +1217,78 @@ def image_generation_node(state: WorkflowState) -> dict[str, Any]:
     set_progress(task_id, 80, "generating article illustrations")
 
     from app.services.image_service import (
+        finalize_figures,
         generate_article_images,
         inject_images_into_markdown,
+        resolve_section_key,
     )
     from app.services.writing_service import _article_sections
     from app.services.chart_service import generate_charts_from_evidence
     from app.services.social_proof_service import generate_social_proof_cards
-    from app.services.figure_extraction_service import select_best_figures
+    from app.services.figure_extraction_service import (
+        _CATEGORY_SECTION,
+        select_best_figures,
+        tag_figures_with_categories,
+    )
 
     # Use actual draft sections (topic-specific) if available, otherwise fallback
     sections = state.get("draft_sections") or _article_sections(project.article_type)
     all_images: list[dict[str, str]] = []
 
     # ── 1. Extracted paper figures (smart-selected) ──────────────
+    # 流程：先语义打标（产出 description）→ 双层准入 → 择优。
+    # 图表准入双层判定：
+    #   a) 单篇论文标题与主题相关（≥2 个内容词命中）；
+    #   b) 图自身的描述与主题相关（≥1 个内容词命中）。
+    # 只靠 (a) 不够：标题里 "AI Agent" 双命中的论文，其插图可能是
+    # "材料发现工作台"这类与主题无关的图——(b) 把这种漏网拦下。
+    # 注意顺序：description 由 tag_figures_with_categories 产出，
+    # 必须先打标再判定，否则 (b) 氡图可判。
+    if extracted_figures:
+        from app.services.search_service import title_query_hits
+
+        # F5: tag figures semantically first so selection and section mapping
+        # are driven by content type, not just geometry.
+        tag_figures_with_categories(extracted_figures, project.title)
+
+        _rq = (project.research_question or state.get("query") or "").strip()
+        before_count = len(extracted_figures)
+        topical_figures = [
+            fig for fig in extracted_figures
+            if title_query_hits(str(fig.get("paper_title") or ""), _rq) >= 2
+            and title_query_hits(str(fig.get("description") or ""), _rq) >= 1
+        ]
+        if len(topical_figures) < before_count:
+            add_log(
+                task_id,
+                f"figure admission: dropped {before_count - len(topical_figures)} figures "
+                f"from off-topic papers or with off-topic content "
+                f"(kept {len(topical_figures)})",
+            )
+        extracted_figures = topical_figures
     if extracted_figures:
         best_figures = select_best_figures(extracted_figures, max_count=8)
+        # 参考文献页/致谢页截图永远不是"配图"：内容是引用列表或致谢文本，
+        # 与任何主题都无关，只会让读者困惑。按 alt 描述与页码特征过滤。
+        _REF_PAGE_PATTERNS = ("参考文献", "references", "bibliography", "致谢", "acknowledg")
+        admittable: list[dict[str, Any]] = []
+        for fig in best_figures:
+            desc = str(fig.get("description") or "").lower()
+            alt = str(fig.get("alt") or "")
+            paper_title = str(fig.get("paper_title") or "")
+            # 末页整页渲染 + 描述/标题命中参考文献特征 → 丢弃
+            if fig.get("source") == "page_render" and fig.get("page", 0) >= 10:
+                combined = f"{desc}{alt}{paper_title}".lower()
+                if any(p in combined for p in _REF_PAGE_PATTERNS):
+                    continue
+            admittable.append(fig)
+        if len(admittable) < len(best_figures):
+            add_log(
+                task_id,
+                f"figure admission: dropped {len(best_figures) - len(admittable)} "
+                f"reference-page screenshots",
+            )
+        best_figures = admittable
         for fig in best_figures:
             fig_path = fig.get("path", "")
             if not fig_path:
@@ -937,8 +1297,12 @@ def image_generation_node(state: WorkflowState) -> dict[str, Any]:
             page = fig.get("page", 0)
             aspect = fig.get("width", 1) / max(fig.get("height", 1), 1)
 
-            # Smart section assignment based on source, page, and aspect ratio
-            if source == "page_render" and page == 1:
+            # Smart section assignment: semantic category wins when tagged,
+            # source/page/aspect heuristics remain the fallback.
+            category = fig.get("category", "")
+            if category in _CATEGORY_SECTION:
+                section = _CATEGORY_SECTION[category]
+            elif source == "page_render" and page == 1:
                 section = "Background"      # title/overview page
             elif source == "page_render":
                 section = "Results"         # rendered table pages
@@ -951,9 +1315,10 @@ def image_generation_node(state: WorkflowState) -> dict[str, Any]:
             else:
                 section = "Framework"       # method illustrations
 
+            alt = fig.get("description") or f"论文配图（第{page}页）"
             all_images.append({
                 "path": fig_path,
-                "alt": f"Paper figure (page {page}): {fig.get('paper_title', '')[:50]}",
+                "alt": alt[:80],
                 "section": section,
                 "source": "extracted_figure",
             })
@@ -981,6 +1346,7 @@ def image_generation_node(state: WorkflowState) -> dict[str, Any]:
             papers=papers,
             project_id=state["project_id"],
             output_dir=social_dir,
+            research_question=(project.research_question or state.get("query") or "").strip(),
         )
         all_images.extend(social_images)
         add_log(task_id, f"generated {len(social_images)} social proof cards")
@@ -990,6 +1356,21 @@ def image_generation_node(state: WorkflowState) -> dict[str, Any]:
 
     # ── 4. Decorative illustrations (existing Pollinations + SVG) ──
     try:
+        kind_by_section = {
+            p.get("section", ""): p.get("kind", "")
+            for p in (state.get("figure_plans") or [])
+        }
+        # Sections that already carry a matplotlib data chart skip the SVG
+        # dashboard pass - the same metrics must not be visualized twice.
+        chart_covered_sections = {img.get("section", "") for img in all_images if img.get("source") == "chart"}
+        skip_sections = {resolve_section_key(s) for s in chart_covered_sections}
+        # 证据语境的图注随 prompt 下发：生图模型画"这节要表达的内容"，
+        # 而不是仅凭章节标题的泛泛概念图
+        caption_by_section = {
+            str(p.get("section", "")): str(p.get("caption", ""))
+            for p in (state.get("figure_plans") or [])
+            if p.get("caption")
+        }
         decorative_images = generate_article_images(
             project_id=state["project_id"],
             project_title=project.title,
@@ -997,6 +1378,10 @@ def image_generation_node(state: WorkflowState) -> dict[str, Any]:
             sections=sections,
             article_type=project.article_type,
             draft_content=draft.content_md,
+            evidence_cards=[_evidence_to_dict(c) for c in cards],
+            kind_by_section=kind_by_section,
+            skip_sections=skip_sections,
+            caption_by_section=caption_by_section,
         )
         # When we have real evidence images, reduce decorative images
         if len(all_images) >= 3:
@@ -1007,16 +1392,148 @@ def image_generation_node(state: WorkflowState) -> dict[str, Any]:
         logger.exception("Decorative image generation failed (non-fatal)")
         add_log(task_id, "decorative image generation failed (non-fatal)")
 
-    # ── Inject all images into markdown ────────────────────────────
+    # ── Inject all images into markdown (F1/F3) ────────────────────
+    # Attach plan captions to generated images whose section matches a planned
+    # figure, so the caption comes from the evidence-grounded plan. Extracted
+    # paper figures are excluded on purpose: the plan describes the figure we
+    # *want*, not the figure we *have* — attaching it to an arbitrary extracted
+    # image produces confident-looking but wrong captions. Extracted figures
+    # keep their own vision/description alt text as the caption.
+    # Plans key on LLM-generated topical headings ("实验结果与分析") while
+    # images carry hardcoded English tags ("Results") - exact matching almost
+    # always missed, leaving charts caption-less and ref_key-less (floating
+    # figures). Join through the canonical section keys instead.
+    plan_by_canon: dict[str, dict[str, Any]] = {}
+    for p in (state.get("figure_plans") or []):
+        plan_by_canon.setdefault(resolve_section_key(p.get("section", "")), p)
+    for img in all_images:
+        plan = plan_by_canon.get(resolve_section_key(img.get("section", "")))
+        if plan and img.get("source") != "extracted_figure":
+            # Attach the evidence-grounded caption and the plan's ref_key so
+            # cross-references resolve to the *actual* figure number after
+            # injection (extracted/social images shift the running count).
+            if not img.get("caption"):
+                img["caption"] = plan.get("caption", "")
+            if not img.get("ref_key"):
+                img["ref_key"] = plan.get("ref_key", "")
+
+    # Inject images first, then number + resolve cross-refs in a single pass.
+    # The ref_key -> figure-number map is only knowable after injection, so
+    # placeholders must survive until images are in place; finalize resolves
+    # them (falling back to the plan index) even when no images were produced.
     if all_images:
         draft.content_md = inject_images_into_markdown(draft.content_md, all_images)
+        draft.content_md = finalize_figures(draft.content_md, all_images)
         state["db"].flush()
         add_log(task_id, f"injected {len(all_images)} total illustrations into draft")
+    else:
+        draft.content_md = finalize_figures(draft.content_md, all_images)
 
+    # L2: record each figure's evidence dependency so the revise loop can
+    # detect sections whose evidence changed and re-sync figure captions.
+    deps: list[dict[str, Any]] = []
+    if all_images:
+        from app.services.image_service import _extract_section_content
+        from app.services.writing_service import _cited_evidence_ids
+
+        for img in all_images:
+            sec = img.get("section", "")
+            sec_text = _extract_section_content(draft.content_md, sec)
+            ids = sorted(_cited_evidence_ids(sec_text))
+            plan = plan_by_canon.get(resolve_section_key(sec))
+            if plan and plan.get("evidence_id"):
+                ids = sorted(set(ids) | {str(plan["evidence_id"])})
+            deps.append(
+                {"path": img.get("path", ""), "section": sec, "evidence_ids": ids}
+            )
+
+    # 增量提交：带图草稿落盘，崩溃后 drafts 表保留最新带图版本。
+    draft_id, draft_version = draft.id, draft.version
+    state["db"].commit()
+    set_artifact(task_id, "draft_id", draft_id)
+    set_artifact(task_id, "draft_version", draft_version)
     return {
         "generated_images": all_images,
+        "figure_deps": deps,
         "current_content": draft.content_md,
     }
+
+
+# ── Node 5b: refresh_figures (L2) ────────────────────────────────
+
+
+def refresh_figures_node(state: WorkflowState) -> dict[str, Any]:
+    """L2: re-sync figures whose evidence dependency changed after a revision.
+
+    Each figure records the evidence ids cited in its section at generation
+    time (``figure_deps``). After a revise round, sections whose cited evidence
+    changed get their figure captions/alt refreshed from the current text.
+    Idempotent: existing ``**图N：**`` captions are replaced in place, so figure
+    numbers stay stable across revision rounds. Image bytes are left untouched
+    because charts are derived from evidence cards, which do not change inside
+    the revise loop.
+    """
+    task_id = state["task_id"]
+    current = state.get("current_content", "")
+    images = state.get("generated_images", [])
+    deps = state.get("figure_deps", [])
+    if not deps or not images or not current:
+        return {}
+
+    from app.services.image_service import _extract_section_content, finalize_figures
+    from app.services.writing_service import _cited_evidence_ids
+
+    plan_by_section = {
+        p.get("section", ""): p for p in (state.get("figure_plans") or [])
+    }
+
+    changed_sections: set[str] = set()
+    for dep in deps:
+        sec = dep.get("section", "")
+        if not sec:
+            continue
+        current_ids = sorted(
+            _cited_evidence_ids(_extract_section_content(current, sec))
+        )
+        if current_ids != (dep.get("evidence_ids") or []):
+            changed_sections.add(sec)
+
+    if not changed_sections:
+        add_log(task_id, "figure refresh: no evidence changes, figures stay in sync")
+        return {}
+
+    # Refresh captions for images in affected sections. Planned figures keep
+    # their evidence-derived caption; others fall back to the section's first
+    # sentence so captions always reflect the revised text. Extracted paper
+    # figures are skipped: their caption describes the actual image content
+    # (vision-tagged), which does not change with the text.
+    for img in images:
+        if img.get("section") not in changed_sections:
+            continue
+        if img.get("source") == "extracted_figure":
+            continue
+        plan = plan_by_section.get(img.get("section", ""))
+        if plan and plan.get("caption"):
+            img["caption"] = plan["caption"]
+            img["alt"] = plan["caption"]
+        else:
+            sec_text = _extract_section_content(current, img.get("section", ""))
+            first_sentence = (
+                re.sub(r"\s+", " ", sec_text.split("。", 1)[0]).strip()
+                if sec_text
+                else ""
+            )
+            if first_sentence:
+                img["caption"] = first_sentence[:60]
+                img["alt"] = first_sentence[:60]
+
+    refreshed = finalize_figures(current, images)
+    add_log(
+        task_id,
+        f"figure refresh: {len(changed_sections)} section(s) evidence changed "
+        f"({sorted(changed_sections)}), captions re-synced",
+    )
+    return {"current_content": refreshed}
 
 
 # ── Node 5: initial_review ───────────────────────────────────────
@@ -1030,9 +1547,22 @@ def initial_review_node(state: WorkflowState) -> dict[str, Any]:
     cards = state["cards"]
 
     set_progress(task_id, 86, "reviewing draft (multi-agent debate)")
+
+    # S4: tag cards with their conflict group so the reviewer can flag drafts
+    # that cite both sides of a conflict without comparing them.
+    group_by_card_id: dict[str, str] = {}
+    for group in state.get("conflict_groups") or []:
+        for cid in group.get("card_ids", []):
+            group_by_card_id[str(cid)] = group.get("group_id", "")
+    review_cards = []
+    for c in cards:
+        card_dict = _evidence_to_dict(c)
+        card_dict["conflict_group"] = group_by_card_id.get(str(c.id), "")
+        review_cards.append(card_dict)
+
     review_payloads, review_metrics = debate_review_with_metrics(
         draft.content_md,
-        evidence_cards=[_evidence_to_dict(c) for c in cards],
+        evidence_cards=review_cards,
         article_type=project.article_type,
         task_id=task_id,
     )
@@ -1101,11 +1631,36 @@ def initial_review_node(state: WorkflowState) -> dict[str, Any]:
 
 def revise_node(state: WorkflowState) -> dict[str, Any]:
     task_id = state["task_id"]
+    # Regression rollback: if the last revision scored below the best version,
+    # keep revising from best_content instead of compounding edits on a worse
+    # draft -- otherwise later rounds burn their budget degrading it further.
+    base_content = state["current_content"]
+    current_score = float((state.get("current_metrics") or {}).get("overall_score") or 0.0)
+    best_score = float(state.get("best_score") or 0.0)
+    if state.get("best_content") and best_score > current_score + 1e-9:
+        base_content = state["best_content"]
+        add_log(
+            task_id,
+            f"last revision regressed ({current_score:.3f} < best {best_score:.3f}); "
+            f"revising from best-scoring content instead",
+        )
+    # Pass the FULL review issues (description / suggestion / claim /
+    # evidence_ids) to the reviser. The old code truncated to
+    # issue_type/severity/location, which left _llm_revise_paragraph with
+    # `description=None, suggestion=None` -- the reviser literally did not
+    # know what was wrong, so the 3-round review↔revise loop was blind.
     revised = revise_draft(
-        state["current_content"],
+        base_content,
         issues=[
-            {"issue_type": str(i.get("issue_type") or ""), "severity": str(i.get("severity") or ""),
-             "location": str(i.get("location") or "")}
+            {
+                "issue_type": str(i.get("issue_type") or ""),
+                "severity": str(i.get("severity") or ""),
+                "location": str(i.get("location") or ""),
+                "claim": str(i.get("claim") or ""),
+                "description": str(i.get("description") or ""),
+                "suggestion": str(i.get("suggestion") or ""),
+                "evidence_ids": list(i.get("evidence_ids") or []),
+            }
             for i in state["current_issues"]
         ],
     )
@@ -1201,6 +1756,24 @@ def export_node(state: WorkflowState) -> dict[str, Any]:
     best_metrics = state["best_metrics"]
     best_issues = state["best_issues"]
 
+    # Reader-facing final output:
+    # 1. Re-run de-AI processing: revision rewrites paragraphs at LLM
+    #    temperature, reintroducing the connector/template cliches the first
+    #    pass removed (de_ai preserves evidence comments, so run it before
+    #    citation rendering).
+    # 2. Render evidence traceability comments as visible [N] in-text
+    #    citations plus a formatted references section
+    #    (project.citation_style drives the format), then strip any remaining
+    #    markers. Previously citation_style was accepted but never used and
+    #    the final draft carried no citations at all.
+    from app.services.citation_service import render_in_text_citations
+    from app.services.de_ai_service import de_ai_markdown
+
+    final_content = de_ai_markdown(state["best_content"], intensity=0.3)
+    final_content = strip_evidence_comments(
+        render_in_text_citations(final_content, cards, state["project"].citation_style)
+    )
+
     revised_status = "publication_prepared" if best_metrics.get("publication_prepared") else "revised_needs_human_review"
     revised_critical = len([i for i in best_issues if i.get("severity") == "high"])
 
@@ -1208,12 +1781,17 @@ def export_node(state: WorkflowState) -> dict[str, Any]:
         id=str(uuid4()), project_id=state["project_id"],
         version=_next_draft_version(state["project_id"], db),
         title=(state["draft"].title or "Draft") + " (Revised)",
-        content_md=state["best_content"], status=revised_status,
+        content_md=final_content, status=revised_status,
         quality_score=score_quality(len(best_issues), revised_critical, metrics=best_metrics),
         created_at=_now(),
     )
     db.add(revised_draft)
     db.flush()
+    # 增量提交：修订稿 + 审稿 issue 落盘，崩溃后可取回最新修订版本。
+    rd_id, rd_version = revised_draft.id, revised_draft.version
+    db.commit()
+    set_artifact(task_id, "draft_id", rd_id)
+    set_artifact(task_id, "draft_version", rd_version)
 
     export_files: dict[str, str] = {}
     if payload.auto_export:
@@ -1351,10 +1929,14 @@ def create_workflow_graph():
     builder.add_node("gather_web_sources", _timed_node("web", "gather_web_sources", web_sources_node))
     builder.add_node("gather_community_sources", _timed_node("community", "gather_community_sources", community_sources_node))
     builder.add_node("relevance_filter", _timed_node("filter", "relevance_filter", relevance_filter_node))
+    builder.add_node("conflict_detection", _timed_node("filter", "conflict_detection", conflict_detection_node))
+    builder.add_node("thesis_thread", _timed_node("draft", "thesis_thread", thesis_thread_node))
+    builder.add_node("plan_figures", _timed_node("draft", "plan_figures", plan_figures_node))
     builder.add_node("generate_draft", _timed_node("draft", "generate_draft", draft_node))
     builder.add_node("generate_images", _timed_node("images", "generate_images", image_generation_node))
     builder.add_node("initial_review", _timed_node("review", "initial_review", initial_review_node))
     builder.add_node("revise", _timed_node("review", "revise", revise_node))
+    builder.add_node("refresh_figures", _timed_node("review", "refresh_figures", refresh_figures_node))
     builder.add_node("review", _timed_node("review", "review", review_node))
     builder.add_node("export", _timed_node("export", "export", export_node))
     builder.add_node("assemble_result", _timed_node("export", "assemble_result", result_node))
@@ -1366,13 +1948,19 @@ def create_workflow_graph():
     builder.add_edge("build_evidence", "gather_web_sources")
     builder.add_edge("gather_web_sources", "gather_community_sources")
     builder.add_edge("gather_community_sources", "relevance_filter")
-    builder.add_edge("relevance_filter", "generate_draft")
+    builder.add_edge("relevance_filter", "conflict_detection")
+    builder.add_edge("conflict_detection", "thesis_thread")
+    builder.add_edge("thesis_thread", "plan_figures")
+    builder.add_edge("plan_figures", "generate_draft")
     builder.add_edge("generate_draft", "generate_images")
     builder.add_edge("generate_images", "initial_review")
 
     builder.add_conditional_edges("initial_review", _route_after_review, {"revise": "revise", "export": "export"})
     builder.add_conditional_edges("review", _route_after_review, {"revise": "revise", "export": "export"})
-    builder.add_edge("revise", "review")
+    # L2: after each revise round, re-sync figure captions with the revised
+    # text before the next review.
+    builder.add_edge("revise", "refresh_figures")
+    builder.add_edge("refresh_figures", "review")
 
     builder.add_edge("export", "assemble_result")
     builder.add_edge("assemble_result", END)

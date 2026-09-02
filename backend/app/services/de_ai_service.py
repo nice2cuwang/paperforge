@@ -302,6 +302,7 @@ def de_ai_markdown(content_md: str, intensity: float = 0.7) -> str:
             or stripped.startswith("```")
             or stripped.startswith("|")
             or stripped.startswith("[")
+            or stripped.startswith("!")  # markdown image lines, keep intact
         ):
             _flush()
             output.append(line)

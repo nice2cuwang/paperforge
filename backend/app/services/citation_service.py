@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from app.services.http_client import create_httpx_client
@@ -208,6 +209,95 @@ def format_bibliography(papers: list[Any], style: str = "gb7714") -> str:
     if style == "bibtex":
         return "\n\n".join(entries)
     return "\n".join(f"[{i + 1}] {entry}" for i, entry in enumerate(entries))
+
+
+# ---------------------------------------------------------------------------
+# In-text citation rendering
+# ---------------------------------------------------------------------------
+
+_EVIDENCE_COMMENT_RE = re.compile(r"<!--\s*evidence:\s*([^>]+?)\s*-->", re.IGNORECASE)
+
+# Project-level citation_style strings (free-form UI input) -> formatter keys.
+_CITATION_STYLE_ALIASES = {
+    "gb/t 7714": "gb7714", "gb7714": "gb7714", "gb/t7714": "gb7714", "国标": "gb7714",
+    "g b/t 7714": "gb7714",
+    "apa": "apa7", "apa7": "apa7", "apa 7": "apa7", "apa 7th": "apa7",
+    "mla": "mla9", "mla9": "mla9", "mla 9": "mla9",
+}
+
+
+def _normalize_citation_style(style: str | None) -> str:
+    key = re.sub(r"\s+", " ", str(style or "").strip().lower())
+    return _CITATION_STYLE_ALIASES.get(key, "gb7714")
+
+
+def render_in_text_citations(content_md: str, cards: Any, citation_style: str | None = None) -> str:
+    """Turn ``<!-- evidence: id -->`` markers into visible ``[N]`` citations
+    and append a formatted references section.
+
+    *cards* is any iterable of evidence-card objects exposing ``id`` and a
+    ``paper`` relationship (paper-backed academic cards). Markers whose card
+    has no backing paper (web/community sources) are simply removed; the
+    BibTeX export keeps the full per-paper list unchanged. Numbering follows
+    first appearance in the text, with all cards of one paper sharing a number.
+    """
+    card_paper: dict[str, Any] = {}
+    knowledge_cited = False
+    for card in cards:
+        try:
+            paper = getattr(card, "paper", None)
+        except Exception:
+            paper = None
+        if paper is not None:
+            # llm_knowledge 证据背后的 paper 是虚拟占位（无作者/年份/出处），
+            # 「佚名. xxx. llm_knowledge.」不是可核验的引用，不进参考文献。
+            source_type = str(getattr(card, "source_type", "") or "").lower()
+            if source_type == "llm_knowledge":
+                knowledge_cited = True
+                continue
+            card_paper[str(card.id)] = paper
+
+    paper_number: dict[int, int] = {}
+    ordered_papers: list[Any] = []
+
+    def _cite_number(paper: Any) -> int:
+        # Key by object identity: ORM papers are unhashable SimpleNamespace-like
+        # instances and one paper object is shared by all its cards.
+        key = id(paper)
+        if key not in paper_number:
+            paper_number[key] = len(ordered_papers) + 1
+            ordered_papers.append(paper)
+        return paper_number[key]
+
+    def _replace(match: re.Match[str]) -> str:
+        ids = [part.strip() for part in match.group(1).split(",") if part.strip()]
+        numbers: list[int] = []
+        for ev_id in ids:
+            paper = card_paper.get(ev_id)
+            if paper is not None:
+                num = _cite_number(paper)
+                if num not in numbers:
+                    numbers.append(num)
+        if not numbers:
+            return ""
+        numbers.sort()
+        return "[" + ",".join(str(n) for n in numbers) + "]"
+
+    cited = _EVIDENCE_COMMENT_RE.sub(_replace, content_md)
+
+    if not ordered_papers:
+        if knowledge_cited:
+            return (
+                cited.rstrip()
+                + "\n\n## 参考文献\n\n本文部分内容基于模型已有知识整理，无可引用的外部文献；请读者核实关键事实。\n"
+            )
+        return cited
+    style = _normalize_citation_style(citation_style)
+    bibliography = format_bibliography(ordered_papers, style=style)
+    out = cited.rstrip() + "\n\n## 参考文献\n\n" + bibliography + "\n"
+    if knowledge_cited:
+        out += "\n> 注：文中标注「基于模型已有知识」的段落由 AI 生成，不属于上述参考文献的支撑范围。\n"
+    return out
 
 
 def query_crossref(doi: str, timeout: float = 10.0) -> dict[str, Any]:
