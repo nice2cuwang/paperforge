@@ -348,6 +348,15 @@ _PROVIDERS: list[ProviderDef] = [
         category=CATEGORY_LOCAL,
     ),
     ProviderDef(
+        id="ollama", name="Ollama（本地）", logo_svg=LOGO_LOCAL,
+        description="Ollama 本地推理，OpenAI 兼容端点（默认 11434/v1），免 API Key。",
+        base_url="http://localhost:11434/v1", default_base_url="http://localhost:11434/v1",
+        protocol=PROTOCOL_OPENAI, strategy_key=STRATEGY_OPENAI,
+        capability=CapabilityDef(True, False, False, 131072),
+        models=[LOCAL_MODEL], requires_api_key=False, supports_custom_base=True,
+        category=CATEGORY_LOCAL,
+    ),
+    ProviderDef(
         id="claude-cn", name="Claude CN", logo_svg=LOGO_ANTHROPIC,
         description="Claude 国内代理，Anthropic 兼容协议。",
         base_url="https://claude-cn.com/anthropic/v1", default_base_url="https://claude-cn.com/anthropic/v1",
@@ -663,7 +672,7 @@ def models_headers(p: ProviderDef, api_key: str | None) -> dict[str, str]:
 
 
 def test_headers(p: ProviderDef, api_key: str | None) -> dict[str, str]:
-    """Headers for the connectivity test. Like models_headers but ``local`` uses a no-key sentinel."""
+    """Headers for the connectivity test. Like models_headers but local-category providers (``local``/``ollama``) use a no-key sentinel."""
     if p.protocol == PROTOCOL_ANTHROPIC:
         h: dict[str, str] = {
             "Content-Type": "application/json",
@@ -673,7 +682,7 @@ def test_headers(p: ProviderDef, api_key: str | None) -> dict[str, str]:
     elif p.protocol == PROTOCOL_AZURE:
         h = {"Content-Type": "application/json", "api-key": api_key or ""}
     else:
-        key = api_key or ("no-key" if p.id == "local" else "")
+        key = api_key or ("no-key" if p.category == CATEGORY_LOCAL else "")
         h = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
     for k, v in p.listing_headers.items():
         h[k] = v
@@ -686,7 +695,7 @@ def test_body(p: ProviderDef, model: str) -> dict[str, Any]:
         "messages": [{"role": "user", "content": "Say 'ok' only."}],
         "max_tokens": 5,
     }
-    if p.id == "local":
+    if p.category == CATEGORY_LOCAL:
         body["stream"] = False
     return body
 

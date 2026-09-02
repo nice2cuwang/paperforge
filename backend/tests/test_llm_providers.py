@@ -54,11 +54,12 @@ def test_categories_valid():
 
 
 def test_known_provider_count_preserved():
-    # 30 major + 28 marketplace + 1 local. Update if providers are added/dropped.
+    # 30 major + 28 marketplace + 2 local (local generic / ollama). Update if
+    # providers are added/dropped.
     from collections import Counter
     counts = Counter(p.category for p in P.PROVIDER_LIST)
-    assert counts == {"major": 30, "marketplace": 28, "local": 1}
-    assert len(P.PROVIDER_LIST) == 59
+    assert counts == {"major": 30, "marketplace": 28, "local": 2}
+    assert len(P.PROVIDER_LIST) == 60
 
 
 # ---------------------------------------------------------------------------
@@ -170,12 +171,22 @@ def test_models_headers_auth_variants():
 def test_test_headers_local_uses_no_key_sentinel():
     h = P.test_headers(P.get_provider("local"), None)
     assert h["Authorization"] == "Bearer no-key"
+    # ollama shares the local category semantics
+    h2 = P.test_headers(P.get_provider("ollama"), None)
+    assert h2["Authorization"] == "Bearer no-key"
 
 
 def test_no_models_messages():
     assert "AWS Bedrock" in P.no_models_message(P.get_provider("aws-bedrock"))
     assert "Mimo" in P.no_models_message(P.get_provider("xiaomi-mimo"))
     assert P.no_models_message(P.get_provider("openai")) is None
+
+
+def test_local_body_force_non_streaming():
+    # Local inference servers (Ollama / vLLM / llama.cpp) can hang or misbehave
+    # on streamed probe requests -- the connectivity probe forces stream=false.
+    assert P.test_body(P.get_provider("local"), "x")["stream"] is False
+    assert P.test_body(P.get_provider("ollama"), "x")["stream"] is False
 
 
 def test_parse_models_response_normalizes():
@@ -219,7 +230,7 @@ def test_presets_carry_category():
     cats = Counter(p.category for p in R._PRESETS)
     assert cats["major"] == 30
     assert cats["marketplace"] == 28
-    assert cats["local"] == 1
+    assert cats["local"] == 2
     # local preset is the local category
     assert R._PRESET_MAP["local"].category == "local"
     assert R._PRESET_MAP["dmxapi"].category == "marketplace"

@@ -431,7 +431,7 @@ def update_config(payload: LLMConfigUpdate, db: Session = Depends(get_db)) -> LL
         prov = _PROVIDER_MAP.get(provider_id)
         if prov:
             model_ids = {m.id for m in prov.models}
-            if changes["model"] not in model_ids and provider_id not in ("local", "openrouter", "xiaomi-mimo"):
+            if changes["model"] not in model_ids and provider_id not in ("local", "ollama", "openrouter", "xiaomi-mimo"):
                 # Allow any model ID but warn - new releases / OpenRouter custom model names / Xiaomi Mimo [1m] suffixes
                 logger.warning("Accepting unknown model '%s' for provider '%s'", changes["model"], provider_id)
 
@@ -483,7 +483,7 @@ def create_config(payload: LLMConfigCreate, db: Session = Depends(get_db)) -> LL
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown provider: {payload.provider}")
 
     model_ids = {m.id for m in preset.models}
-    if payload.model not in model_ids and payload.provider not in ("local", "openrouter", "xiaomi-mimo"):
+    if payload.model not in model_ids and payload.provider not in ("local", "ollama", "openrouter", "xiaomi-mimo"):
         # Allow any model ID but warn - new releases / OpenRouter custom model names / Xiaomi Mimo [1m] suffixes
         logger.warning("Accepting unknown model '%s' for provider '%s'", payload.model, payload.provider)
 
@@ -557,7 +557,7 @@ def patch_config(config_id: str, payload: LLMConfigUpdate, db: Session = Depends
         prov = _PROVIDER_MAP.get(provider_id)
         if prov:
             model_ids = {m.id for m in prov.models}
-            if changes["model"] not in model_ids and provider_id not in ("local", "openrouter", "xiaomi-mimo"):
+            if changes["model"] not in model_ids and provider_id not in ("local", "ollama", "openrouter", "xiaomi-mimo"):
                 # Allow any model ID but warn - new releases / OpenRouter custom model names / Xiaomi Mimo [1m] suffixes
                 logger.warning("Accepting unknown model '%s' for provider '%s'", changes["model"], provider_id)
 

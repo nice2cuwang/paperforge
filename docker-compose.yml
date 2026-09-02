@@ -73,5 +73,20 @@ services:
     ports:
       - "8070:8070"
 
+  # Optional local LLM inference for a key-free PaperForge setup.
+  # NOT part of the default profile (no LLM dependency unless you opt in).
+  # Usage: docker compose --profile local-llm up -d
+  #        docker compose --profile local-llm exec ollama ollama pull qwen2.5:7b
+  # Then point a PaperForge LLM config at http://ollama:11434/v1 (backend in
+  # Docker) — see docs/local-models.md.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["local-llm"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
 volumes:
   frontend_node_modules:
+  ollama_data:

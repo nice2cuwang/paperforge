@@ -112,6 +112,17 @@ docker compose --profile infra up -d
 
 启动后在 `.env` 中配置对应的连接地址即可切换至 PostgreSQL 或 Qdrant 等高性能组件。
 
+### 5. 使用本地模型（可选，零成本）
+
+不想使用云端 API 时，可用 Ollama / vLLM 等本地推理作为 LLM 后端（免 API Key）：
+
+```bash
+docker compose --profile local-llm up -d
+docker compose --profile local-llm exec ollama ollama pull qwen2.5:7b
+```
+
+随后在 LLM 设置中添加「Ollama（本地）」配置并激活即可。详见 [本地模型接入文档](docs/local-models.md)。
+
 ---
 
 ## 使用方式
@@ -271,7 +282,7 @@ PaperForge/
 
 **数据库** — 默认使用 SQLite（`backend/data/paperforge.db`），可通过 `DATABASE_URL` 切换至 PostgreSQL。
 
-**LLM 提供商** — 运行时通过 `/llm-settings` 页面或 API 配置，无需在环境变量中填写 API Key。支持 OpenAI、DeepSeek、Kimi、智谱、通义千问及本地模型。
+**LLM 提供商** — 运行时通过 `/llm-settings` 页面或 API 配置，无需在环境变量中填写 API Key。支持 OpenAI、DeepSeek、Kimi、智谱、通义千问及本地模型（Ollama / vLLM 免 Key 接入见 [本地模型接入文档](docs/local-models.md)）。
 
 **代理** — 在国内网络环境下，可通过 `PAPERFORGE_PROXY_URL` 配置出站代理。Docker 环境中应使用 `host.docker.internal` 而非 `127.0.0.1`。
 
