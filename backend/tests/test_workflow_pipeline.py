@@ -2,92 +2,18 @@ import time
 
 import pytest
 
+import hermetic_env
 from app.services.search_service import PaperCandidate
-
-_EMPTY_LLM_RESPONSE = {
-    "content": "",
-    "usage": None,
-    "latency_ms": 0,
-    "error": "No active LLM config (hermetic test mock)",
-    "_reasoning": None,
-}
-
-
-def _empty_chat_completion(*args, **kwargs):
-    return _EMPTY_LLM_RESPONSE
-
-
-def _raise_fn(message: str):
-    def _raise(*args, **kwargs):
-        raise RuntimeError(message)
-
-    return _raise
 
 
 @pytest.fixture(autouse=True)
 def hermetic_environment(monkeypatch):
     """Hermetic environment: no real LLM calls, no outbound network.
 
-    工作流测试必须在 CI 上离线运行：所有 LLM 入口都换成“未配置 LLM”式的
-    空响应（消费方各自走既有降级路径），graph 中绑定的 web/社区/提供方
-    诊断/PDF 解析兜底全部不出网。
+    实现已抽到 tests/hermetic_env.py（与 test_quality_baseline 共用），
+    此处只保留 autouse 挂载点，保证本模块全部用例离线运行。
     """
-    from app.services import debate_service, llm_service, review_service, writing_service
-    from app.services.workflow import graph as workflow_graph
-
-    # ── LLM：模块级绑定（A 类调用方）+ llm_service 属性（late-import B 类）──
-    monkeypatch.setattr(llm_service, "chat_completion", _empty_chat_completion)
-    monkeypatch.setattr(llm_service, "chat_completion_text", lambda *a, **k: "")
-    monkeypatch.setattr(llm_service, "chat_completion_json", lambda *a, **k: {"_error": "hermetic mock"})
-    monkeypatch.setattr(writing_service, "chat_completion_text", lambda *a, **k: "")
-    monkeypatch.setattr(review_service, "chat_completion_text", lambda *a, **k: "")
-    monkeypatch.setattr(review_service, "chat_completion_json", lambda *a, **k: {"_error": "hermetic mock"})
-    monkeypatch.setattr(debate_service, "chat_completion", _empty_chat_completion)
-
-    # ── 网络来源：web / 社区 / LLM 知识检索全空 ──
-    monkeypatch.setattr(workflow_graph, "search_web", lambda *a, **k: [])
-    monkeypatch.setattr(workflow_graph, "fetch_page_details", lambda *a, **k: {})
-    monkeypatch.setattr(workflow_graph, "build_web_evidence", lambda *a, **k: [])
-    monkeypatch.setattr(workflow_graph, "search_reddit", lambda *a, **k: [])
-    monkeypatch.setattr(workflow_graph, "search_zhihu", lambda *a, **k: [])
-    monkeypatch.setattr(workflow_graph, "generate_llm_knowledge", lambda *a, **k: [])
-    monkeypatch.setattr(workflow_graph, "build_community_evidence", lambda *a, **k: [])
-
-    # ── 向量链路全断（embedding 模型推理 + Qdrant）──
-    # CI 无模型缓存、无 Qdrant 部署：解析/召回处的向量写入与查询都应直接
-    # 抛错，让消费方走词法兜底，避免本机默认端点的探测告警或模型下载。
-    # retrieval_service 顶层绑定的别名也要盖住（A 类调用方）。
-    from app.services import embedding_service, qdrant_service, retrieval_service
-
-    monkeypatch.setattr(embedding_service, "encode_single", _raise_fn("hermetic: embedding disabled"))
-    monkeypatch.setattr(embedding_service, "encode_texts", _raise_fn("hermetic: embedding disabled"))
-    monkeypatch.setattr(qdrant_service, "search_chunks", _raise_fn("hermetic: qdrant disabled"))
-    monkeypatch.setattr(qdrant_service, "upsert_chunks", _raise_fn("hermetic: qdrant disabled"))
-    monkeypatch.setattr(retrieval_service, "encode_single", _raise_fn("hermetic: embedding disabled"))
-    monkeypatch.setattr(retrieval_service, "search_chunks", _raise_fn("hermetic: qdrant disabled"))
-    monkeypatch.setattr(retrieval_service, "recall_chunks", _raise_fn("hermetic: qdrant unavailable"))
-
-    # ── 出网兜底：provider 诊断、PDF 解析兜底、PDF 下载 ──
-    monkeypatch.setattr(
-        workflow_graph,
-        "_provider_diagnostics",
-        lambda: {"openalex": "error:hermetic", "crossref": "error:hermetic", "arxiv": "error:hermetic"},
-    )
-    monkeypatch.setattr(
-        workflow_graph,
-        "_resolve_pdf_url_with_fallback",
-        lambda paper, *a, **k: (None, ["hermetic: pdf url resolution disabled"]),
-    )
-    monkeypatch.setattr(
-        workflow_graph,
-        "_download_pdf_for_paper",
-        lambda *a, **k: (_ for _ in ()).throw(OSError("hermetic: pdf download disabled")),
-    )
-
-    # 路由层检索入口（/search-papers）也换成空结果，测试需要时各自覆盖
-    from app.api.routes import workflow as workflow_routes
-
-    monkeypatch.setattr(workflow_routes, "search_papers", lambda *a, **k: [])
+    hermetic_env.install_hermetic(monkeypatch)
 
 
 def _create_project(client):
