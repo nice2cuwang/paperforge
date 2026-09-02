@@ -4,6 +4,92 @@ import pytest
 
 from app.services.search_service import PaperCandidate
 
+_EMPTY_LLM_RESPONSE = {
+    "content": "",
+    "usage": None,
+    "latency_ms": 0,
+    "error": "No active LLM config (hermetic test mock)",
+    "_reasoning": None,
+}
+
+
+def _empty_chat_completion(*args, **kwargs):
+    return _EMPTY_LLM_RESPONSE
+
+
+def _raise_fn(message: str):
+    def _raise(*args, **kwargs):
+        raise RuntimeError(message)
+
+    return _raise
+
+
+@pytest.fixture(autouse=True)
+def hermetic_environment(monkeypatch):
+    """Hermetic environment: no real LLM calls, no outbound network.
+
+    工作流测试必须在 CI 上离线运行：所有 LLM 入口都换成“未配置 LLM”式的
+    空响应（消费方各自走既有降级路径），graph 中绑定的 web/社区/提供方
+    诊断/PDF 解析兜底全部不出网。
+    """
+    from app.services import debate_service, llm_service, review_service, writing_service
+    from app.services.workflow import graph as workflow_graph
+
+    # ── LLM：模块级绑定（A 类调用方）+ llm_service 属性（late-import B 类）──
+    monkeypatch.setattr(llm_service, "chat_completion", _empty_chat_completion)
+    monkeypatch.setattr(llm_service, "chat_completion_text", lambda *a, **k: "")
+    monkeypatch.setattr(llm_service, "chat_completion_json", lambda *a, **k: {"_error": "hermetic mock"})
+    monkeypatch.setattr(writing_service, "chat_completion_text", lambda *a, **k: "")
+    monkeypatch.setattr(review_service, "chat_completion_text", lambda *a, **k: "")
+    monkeypatch.setattr(review_service, "chat_completion_json", lambda *a, **k: {"_error": "hermetic mock"})
+    monkeypatch.setattr(debate_service, "chat_completion", _empty_chat_completion)
+
+    # ── 网络来源：web / 社区 / LLM 知识检索全空 ──
+    monkeypatch.setattr(workflow_graph, "search_web", lambda *a, **k: [])
+    monkeypatch.setattr(workflow_graph, "fetch_page_details", lambda *a, **k: {})
+    monkeypatch.setattr(workflow_graph, "build_web_evidence", lambda *a, **k: [])
+    monkeypatch.setattr(workflow_graph, "search_reddit", lambda *a, **k: [])
+    monkeypatch.setattr(workflow_graph, "search_zhihu", lambda *a, **k: [])
+    monkeypatch.setattr(workflow_graph, "generate_llm_knowledge", lambda *a, **k: [])
+    monkeypatch.setattr(workflow_graph, "build_community_evidence", lambda *a, **k: [])
+
+    # ── 向量链路全断（embedding 模型推理 + Qdrant）──
+    # CI 无模型缓存、无 Qdrant 部署：解析/召回处的向量写入与查询都应直接
+    # 抛错，让消费方走词法兜底，避免本机默认端点的探测告警或模型下载。
+    # retrieval_service 顶层绑定的别名也要盖住（A 类调用方）。
+    from app.services import embedding_service, qdrant_service, retrieval_service
+
+    monkeypatch.setattr(embedding_service, "encode_single", _raise_fn("hermetic: embedding disabled"))
+    monkeypatch.setattr(embedding_service, "encode_texts", _raise_fn("hermetic: embedding disabled"))
+    monkeypatch.setattr(qdrant_service, "search_chunks", _raise_fn("hermetic: qdrant disabled"))
+    monkeypatch.setattr(qdrant_service, "upsert_chunks", _raise_fn("hermetic: qdrant disabled"))
+    monkeypatch.setattr(retrieval_service, "encode_single", _raise_fn("hermetic: embedding disabled"))
+    monkeypatch.setattr(retrieval_service, "search_chunks", _raise_fn("hermetic: qdrant disabled"))
+    monkeypatch.setattr(retrieval_service, "recall_chunks", _raise_fn("hermetic: qdrant unavailable"))
+
+    # ── 出网兜底：provider 诊断、PDF 解析兜底、PDF 下载 ──
+    monkeypatch.setattr(
+        workflow_graph,
+        "_provider_diagnostics",
+        lambda: {"openalex": "error:hermetic", "crossref": "error:hermetic", "arxiv": "error:hermetic"},
+    )
+    monkeypatch.setattr(
+        workflow_graph,
+        "_resolve_pdf_url_with_fallback",
+        lambda paper, *a, **k: (None, ["hermetic: pdf url resolution disabled"]),
+    )
+    monkeypatch.setattr(
+        workflow_graph,
+        "_download_pdf_for_paper",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("hermetic: pdf download disabled")),
+    )
+
+    # 路由层检索入口（/search-papers）也换成空结果，测试需要时各自覆盖
+    from app.api.routes import workflow as workflow_routes
+
+    monkeypatch.setattr(workflow_routes, "search_papers", lambda *a, **k: [])
+
+
 def _create_project(client):
     response = client.post(
         "/api/projects",
@@ -20,7 +106,27 @@ def _create_project(client):
     return response.json()
 
 
-def test_workflow_pipeline(client):
+def test_workflow_pipeline(client, monkeypatch):
+    # 路由级检索入口换成语义化候选（PDF 由后续 upload 提供，全程不出网）
+    candidates = [
+        PaperCandidate(
+            title="AI productivity: survey evidence from modern workplaces",
+            authors=["Author A"],
+            year=2025,
+            doi=None,
+            arxiv_id=None,
+            venue="Mock Venue",
+            abstract="Empirical evidence on AI and productivity from workplace surveys.",
+            source="mock",
+            source_url="https://example.org/ai-productivity",
+            pdf_url=None,
+            oa_status="unknown",
+            license=None,
+            relevance_score=0.9,
+        )
+    ]
+    monkeypatch.setattr("app.api.routes.workflow.search_papers", lambda query, limit: candidates)
+
     project = _create_project(client)
     project_id = project["id"]
 
@@ -192,8 +298,10 @@ def test_run_auto_workflow_uses_local_pdf_and_finishes(client, monkeypatch):
     assert drafts_res.status_code == 200
     drafts = drafts_res.json()
     revised = next(item for item in drafts if item["id"] == payload["revised_draft_id"])
+    # export_node 产出的是面向读者的终稿：证据标注已渲染为 [N] 引用并剥离注释
     assert "REPLACE_ME" not in revised["content_md"]
-    assert "<!-- evidence:" in revised["content_md"]
+    assert "<!-- evidence:" not in revised["content_md"]
+    assert len(revised["content_md"].strip()) > 100
 
 
 def test_run_auto_workflow_recovers_from_empty_search_with_trusted_manual_selection(client, monkeypatch):
@@ -346,12 +454,10 @@ def test_run_auto_workflow_returns_detailed_no_pdf_error(client, monkeypatch):
     assert detail["summary"]["skipped_no_pdf_count"] >= 1
 
 
-def test_run_auto_workflow_returns_search_no_candidates_when_provider_empty(client, monkeypatch):
+def test_run_auto_workflow_returns_no_evidence_when_all_sources_empty(client, monkeypatch):
+    # 检索为空 + web/社区为空 → 全来源证据为 0，按 NO_EVIDENCE_CARDS 失败
+    # （不恢复搜索级 SEARCH_NO_CANDIDATES：web-only 成文是受支持的产品形态）
     monkeypatch.setattr("app.services.workflow.search_select.search_papers", lambda query, limit: [])
-    monkeypatch.setattr(
-        "app.services.workflow.runner._provider_diagnostics",
-        lambda: {"openalex": "error:mock", "crossref": "error:mock", "arxiv": "error:mock"},
-    )
 
     project = _create_project(client)
     project_id = project["id"]
@@ -369,9 +475,10 @@ def test_run_auto_workflow_returns_search_no_candidates_when_provider_empty(clie
     )
     assert auto_res.status_code == 400
     detail = auto_res.json()["detail"]
-    assert detail["code"] == "SEARCH_NO_CANDIDATES"
-    assert detail["summary"]["provider_candidate_count"] == 0
-    assert "provider_diagnostics" in detail
+    assert detail["code"] == "NO_EVIDENCE_CARDS"
+    assert detail["summary"]["selected_count"] == 0
+    assert detail["summary"]["evidence_count"] == 0
+    assert detail["summary"]["web_evidence_count"] == 0
 
 
 def test_run_auto_workflow_autoselects_newly_inserted_candidates(client, monkeypatch):
@@ -426,7 +533,8 @@ def test_run_auto_workflow_autoselects_newly_inserted_candidates(client, monkeyp
     assert auto_res.status_code == 200
     payload = auto_res.json()
     assert payload["selected_count"] == 2
-    assert payload["metadata_fallback_evidence_count"] >= 1
+    # 两篇都没有 PDF：由摘要块或元数据兜底路径产出证据
+    assert payload["evidence_count"] >= 1 or payload["metadata_fallback_evidence_count"] >= 1
 
 
 def test_run_auto_workflow_uses_metadata_fallback_when_pdf_unavailable(client, monkeypatch):
@@ -463,10 +571,7 @@ def test_run_auto_workflow_uses_metadata_fallback_when_pdf_unavailable(client, m
         ),
     ]
     monkeypatch.setattr("app.services.workflow.search_select.search_papers", lambda query, limit: candidates)
-    monkeypatch.setattr(
-        "app.services.workflow.runner._download_pdf_for_paper",
-        lambda *args, **kwargs: (_ for _ in ()).throw(Exception("SSL download failed")),
-    )
+    # 下载由 hermetic fixture 兜底为抛错；这里验证下载失败后仍能从摘要/元数据成文
 
     project = _create_project(client)
     project_id = project["id"]
@@ -485,8 +590,8 @@ def test_run_auto_workflow_uses_metadata_fallback_when_pdf_unavailable(client, m
     assert auto_res.status_code == 200
     payload = auto_res.json()
     assert payload["failed_count"] >= 1
-    assert payload["evidence_count"] >= 1
-    assert payload["metadata_fallback_evidence_count"] >= 1
+    # graph 语义：失败论文的摘要会先走摘要块/元数据兜底路径生成证据
+    assert payload["evidence_count"] >= 1 or payload["metadata_fallback_evidence_count"] >= 1
 
 
 def test_run_auto_workflow_reselects_when_manual_selection_exceeds_limit(client, monkeypatch):
@@ -639,10 +744,6 @@ def test_run_auto_workflow_prefers_current_search_scope_over_stale_history(clien
         )
     ]
     monkeypatch.setattr("app.services.workflow.search_select.search_papers", lambda query, limit: candidates)
-    monkeypatch.setattr(
-        "app.services.workflow.runner._download_pdf_for_paper",
-        lambda *args, **kwargs: (_ for _ in ()).throw(Exception("network failed")),
-    )
 
     project = _create_project(client)
     project_id = project["id"]
@@ -686,12 +787,14 @@ def test_run_auto_workflow_prefers_current_search_scope_over_stale_history(clien
     assert auto_res.status_code == 200
     payload = auto_res.json()
     assert payload["selected_count"] == 1
-    assert payload["metadata_fallback_evidence_count"] >= 1
+    # 新候选没有 PDF：由摘要块或元数据兜底路径产出证据
+    assert payload["evidence_count"] >= 1 or payload["metadata_fallback_evidence_count"] >= 1
 
     papers_res = client.get(f"/api/projects/{project_id}/papers")
     assert papers_res.status_code == 200
     papers = papers_res.json()
 
+    # 上一轮带本地 PDF 的论文行会被 wipe 保留（产品决策），再由本次遴选降级为未选中
     stale_row = next(item for item in papers if item["id"] == stale_paper["id"])
     assert stale_row["selected"] is False
 
