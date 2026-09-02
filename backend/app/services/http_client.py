@@ -1,9 +1,27 @@
 from __future__ import annotations
 
 import os
+import socket
+import logging
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import httpx
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_ipv4(hostname: str) -> str:
+    try:
+        infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
+        if infos:
+            return infos[0][4][0]
+    except socket.gaierror:
+        pass
+    return hostname
+
+
+def get_proxy_host() -> str:
+    return (os.getenv("PAPERFORGE_PROXY_HOST") or "host.docker.internal").strip()
 
 
 def _ensure_scheme(value: str) -> str:
@@ -32,7 +50,7 @@ def normalize_proxy_url(value: str) -> str:
     parsed = urlsplit(_ensure_scheme(raw))
     host = (parsed.hostname or "").strip().lower()
     if host in {"127.0.0.1", "localhost"}:
-        replacement = (os.getenv("PAPERFORGE_PROXY_HOST") or "host.docker.internal").strip()
+        replacement = get_proxy_host()
         if replacement:
             netloc = _rebuild_netloc(parsed, replacement)
             parsed = SplitResult(
@@ -42,6 +60,7 @@ def normalize_proxy_url(value: str) -> str:
                 query=parsed.query,
                 fragment=parsed.fragment,
             )
+
     return urlunsplit(parsed)
 
 
@@ -84,6 +103,23 @@ def create_httpx_client(
     proxy: str | None = None,
 ) -> httpx.Client:
     proxy_url = normalize_proxy_url(proxy) if proxy else resolve_proxy_url()
+    if proxy_url:
+        parsed = urlsplit(proxy_url)
+        host = (parsed.hostname or "").lower()
+        if host == "host.docker.internal":
+            ipv4 = _resolve_ipv4(host)
+            if ipv4 != host:
+                logger.debug("Resolved %s -> %s (force IPv4)", host, ipv4)
+                netloc = _rebuild_netloc(parsed, ipv4)
+                proxy_url = urlunsplit(
+                    SplitResult(
+                        scheme=parsed.scheme,
+                        netloc=netloc,
+                        path=parsed.path,
+                        query=parsed.query,
+                        fragment=parsed.fragment,
+                    )
+                )
     kwargs: dict[str, object] = {
         "timeout": timeout,
         "headers": headers,

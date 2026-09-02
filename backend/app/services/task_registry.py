@@ -57,6 +57,7 @@ def _record_to_dict(task: TaskRecord) -> dict[str, Any]:
         "current_step": task.current_step,
         "logs": task.logs,
         "result": task.result,
+        "artifacts": task.artifacts,
         "created_at": _dt_to_str(task.created_at),
         "updated_at": _dt_to_str(task.updated_at),
         "started_at": _dt_to_str(task.started_at),
@@ -71,6 +72,7 @@ def _dict_to_record(data: dict[str, Any]) -> TaskRecord:
         current_step=data.get("current_step", "queued"),
         logs=data.get("logs", []),
         result=data.get("result", {}),
+        artifacts=data.get("artifacts", {}),
         created_at=_str_to_dt(data["created_at"]),
         updated_at=_str_to_dt(data["updated_at"]),
         started_at=_str_to_dt(data.get("started_at", data["created_at"])),
@@ -91,7 +93,20 @@ def _load() -> dict[str, TaskRecord]:
                 if rec.status == "running":
                     rec.status = "failed"
                     rec.current_step = "failed"
-                    rec.logs.append("failed: 服务端重启，任务中断（无恢复机制）")
+                    draft_id = (rec.artifacts or {}).get("draft_id")
+                    if draft_id:
+                        ver = rec.artifacts.get("draft_version", "?")
+                        rec.logs.append(
+                            f"failed: 服务端重启，任务中断；已保留草稿 v{ver} (id={draft_id})，"
+                            f"可在 drafts 表查询或重跑时复用"
+                        )
+                        rec.result = {
+                            **rec.result,
+                            "recoverable_draft_id": draft_id,
+                            "recoverable_draft_version": ver,
+                        }
+                    else:
+                        rec.logs.append("failed: 服务端重启，任务中断（无恢复机制）")
                     _touch(rec)
                     orphaned += 1
                 records[tid] = rec
@@ -131,6 +146,9 @@ class TaskRecord:
     current_step: str = "queued"
     logs: list[str] = field(default_factory=list)
     result: dict[str, Any] = field(default_factory=dict)
+    # 产物指针：关键节点 commit 后写入（如 draft_id/draft_version），
+    # 让崩溃后失败的任务能指向已落盘的幸存草稿。
+    artifacts: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -197,6 +215,22 @@ def add_log(task_id: str, message: str) -> None:
         if task is None:
             return
         task.logs.append(message)
+        _touch(task)
+        _save()
+
+
+def set_artifact(task_id: str, key: str, value: Any) -> None:
+    """Record a recoverable artifact pointer on a task.
+
+    Called by workflow nodes after they commit a durable artifact (e.g. a draft
+    row) so that, if the process is killed mid-workflow, the orphaned task's
+    failure record points at the surviving artifact.
+    """
+    with _task_lock:
+        task = _task_store.get(task_id)
+        if task is None:
+            return
+        task.artifacts[key] = value
         _touch(task)
         _save()
 

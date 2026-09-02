@@ -147,6 +147,10 @@ def build_evidence(
 ) -> dict:
     _get_project_or_404(project_id, db)
     task = create_task("build-evidence")
+    # 归属本次运行的 LLM 调用到 task/project（token 统计）
+    from app.services.llm_service import clear_task_context, set_task_context
+
+    set_task_context(task.task_id, project_id)
     try:
         set_progress(task.task_id, 20, "loading chunks")
         papers = list(db.scalars(select(Paper).where(Paper.project_id == project_id)).all())
@@ -210,3 +214,5 @@ def build_evidence(
         db.rollback()
         _fail_task_for_exception(task.task_id, exc)
         raise
+    finally:
+        clear_task_context()

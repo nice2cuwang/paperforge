@@ -27,6 +27,14 @@ class LLMConfig(Base):
     enable_reasoning: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     preferred_max_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    # Role flag: at most one config is the designated vision model, used for
+    # image-input calls (figure tagging) when the main writing model cannot
+    # see images. Falls back to the active config when unset.
+    is_vision: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Role flag: designated image-generation model (text-to-image). Used when
+    # no suitable paper figure exists — the workflow generates a topical
+    # illustration via the OpenAI-compatible /images/generations endpoint.
+    is_image_gen: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )

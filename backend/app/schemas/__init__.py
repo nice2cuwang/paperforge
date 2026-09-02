@@ -16,7 +16,14 @@ from app.schemas.llm_config import (
 )
 from app.schemas.paper import PaperCreate, PaperRead, PaperUpdate
 from app.schemas.paper_chunk import PaperChunkCreate, PaperChunkRead, PaperChunkUpdate
-from app.schemas.project import ProjectCreate, ProjectRead, ProjectUpdate
+from app.schemas.project import (
+    ProjectCreate,
+    ProjectRead,
+    ProjectTokenUsage,
+    ProjectUpdate,
+    TokenUsageByModel,
+    TokenUsageByTask,
+)
 from app.schemas.review import ReviewIssueCreate, ReviewIssueRead, ReviewIssueUpdate
 from app.schemas.workflow import (
     BuildEvidenceRequest,
@@ -37,6 +44,9 @@ __all__ = [
     "ProjectCreate",
     "ProjectRead",
     "ProjectUpdate",
+    "ProjectTokenUsage",
+    "TokenUsageByModel",
+    "TokenUsageByTask",
     "PaperCreate",
     "PaperRead",
     "PaperUpdate",

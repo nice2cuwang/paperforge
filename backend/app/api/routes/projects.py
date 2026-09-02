@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session
 
 from app.database import backend_dir, get_db
 from app.models import Project
-from app.schemas import ProjectCreate, ProjectRead, ProjectUpdate
+from app.schemas import ProjectCreate, ProjectRead, ProjectTokenUsage, ProjectUpdate
+from app.services.usage_service import get_project_token_usage
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -80,6 +81,85 @@ def delete_project(project_id: str, db: Session = Depends(get_db)) -> Response:
     db.delete(project)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{project_id}/token-usage", response_model=ProjectTokenUsage)
+def get_token_usage(project_id: str, db: Session = Depends(get_db)) -> dict:
+    """按项目聚合 LLM token 消耗（总量 / 按模型 / 按运行批次）。"""
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    return get_project_token_usage(project_id, db)
+
+
+@router.get("/{project_id}/llm-calls")
+def list_llm_calls(
+    project_id: str,
+    task_id: str | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """项目发给模型的每次调用记录（对话式工作区透明化）。
+
+    返回精简摘要（用途/模型/耗时/消耗/prompt 预览），完整 prompt 原文
+    通过 ``/llm-calls/{call_id}`` 单条获取，避免列表响应过大。
+    """
+    from app.models.audit_log import AuditLog
+
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
+    stmt = select(AuditLog).where(AuditLog.project_id == project_id)
+    if task_id:
+        stmt = stmt.where(AuditLog.task_id == task_id)
+    stmt = stmt.order_by(AuditLog.created_at.desc()).limit(min(max(limit, 1), 500))
+
+    out: list[dict] = []
+    for row in db.scalars(stmt).all():
+        usage = row.usage or {}
+        out.append({
+            "id": row.id,
+            "task_id": row.task_id,
+            "purpose": row.purpose,
+            "model": row.model,
+            "provider": row.provider,
+            "latency_ms": row.latency_ms,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "error": row.error,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "system_prompt_preview": (row.system_prompt_text or "")[:160],
+            "user_prompt_preview": (row.user_prompt_text or "")[:200],
+            # 响应预览：对话卡片直接展示"模型回了什么"，全文仍走详情端点
+            "response_preview": (row.response_text or "")[:200],
+        })
+    return out
+
+
+@router.get("/{project_id}/llm-calls/{call_id}")
+def get_llm_call(project_id: str, call_id: str, db: Session = Depends(get_db)) -> dict:
+    """单次 LLM 调用的完整 payload（system/user prompt 原文 + 响应）。"""
+    from app.models.audit_log import AuditLog
+
+    row = db.get(AuditLog, call_id)
+    if row is None or row.project_id != project_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="LLM call not found")
+    return {
+        "id": row.id,
+        "task_id": row.task_id,
+        "purpose": row.purpose,
+        "provider": row.provider,
+        "model": row.model,
+        "strategy_mode": row.strategy_mode,
+        "system_prompt": row.system_prompt_text,
+        "user_prompt": row.user_prompt_text,
+        "response": row.response_text,
+        "latency_ms": row.latency_ms,
+        "usage": row.usage,
+        "error": row.error,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
 
 
 @router.get("/{project_id}/images/{filepath:path}")

@@ -41,3 +41,42 @@ class ProjectRead(BaseModel):
     settings: dict
     created_at: datetime
     updated_at: datetime
+
+
+# ── Token 用量统计 ────────────────────────────────────────────────
+
+
+class TokenUsageByModel(BaseModel):
+    provider: str
+    model: str
+    calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class TokenUsageByTask(BaseModel):
+    """一次工作流运行（一篇文章）的消耗汇总。"""
+
+    task_id: str | None
+    calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    first_call_at: str | None
+    last_call_at: str | None
+
+
+class ProjectTokenUsage(BaseModel):
+    project_id: str
+    total_calls: int
+    failed_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    total_latency_ms: int
+    avg_latency_ms: int
+    first_call_at: str | None
+    last_call_at: str | None
+    by_model: list[TokenUsageByModel]
+    by_task: list[TokenUsageByTask]

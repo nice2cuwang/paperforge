@@ -115,6 +115,10 @@ def generate_outline(
     project = _get_project_or_404(project_id, db)
     del payload
     task = create_task("generate-outline")
+    # 归属本次运行的 LLM 调用到 task/project（token 统计）
+    from app.services.llm_service import clear_task_context, set_task_context
+
+    set_task_context(task.task_id, project_id)
     try:
         cards = list(db.scalars(select(EvidenceCard).where(EvidenceCard.project_id == project_id)).all())
         content = build_outline(
@@ -141,6 +145,8 @@ def generate_outline(
         db.rollback()
         _fail_task_for_exception(task.task_id, exc)
         raise
+    finally:
+        clear_task_context()
 
 
 @router.post("/projects/{project_id}/generate-draft")
@@ -149,6 +155,9 @@ def generate_draft(
 ) -> dict:
     project = _get_project_or_404(project_id, db)
     task = create_task("generate-draft")
+    from app.services.llm_service import clear_task_context, set_task_context
+
+    set_task_context(task.task_id, project_id)
     try:
         cards = list(db.scalars(select(EvidenceCard).where(EvidenceCard.project_id == project_id)).all())
         if not cards:
@@ -186,3 +195,5 @@ def generate_draft(
         db.rollback()
         _fail_task_for_exception(task.task_id, exc)
         raise
+    finally:
+        clear_task_context()

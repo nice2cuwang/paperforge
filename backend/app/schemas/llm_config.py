@@ -24,6 +24,8 @@ class LLMConfigRead(BaseModel):
     enable_reasoning: bool = True
     preferred_max_tokens: int | None = None
     is_active: bool = True
+    is_vision: bool = False
+    is_image_gen: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -54,6 +56,8 @@ class LLMConfigCreate(BaseModel):
     strategy_mode: str = "balanced"
     enable_reasoning: bool = True
     preferred_max_tokens: int | None = None
+    is_vision: bool = False
+    is_image_gen: bool = False
 
     @field_validator("temperature")
     @classmethod
@@ -95,6 +99,8 @@ class LLMConfigUpdate(BaseModel):
     enable_reasoning: bool | None = None
     preferred_max_tokens: int | None = None
     is_active: bool | None = None
+    is_vision: bool | None = None
+    is_image_gen: bool | None = None
 
     @field_validator("temperature")
     @classmethod
@@ -143,6 +149,36 @@ class LLMTestResponse(BaseModel):
     usage: dict[str, Any] | None = None
 
 
+class LLMModelsFetchRequest(BaseModel):
+    """Request body for fetching live model list from a provider's API."""
+    provider: str = Field(min_length=1, max_length=64)
+    api_key: str | None = None
+    api_base: str | None = None
+    proxy_url: str | None = None
+    use_system_proxy: bool = False
+    timeout: int = 15
+    config_id: str | None = Field(
+        default=None,
+        description="If provided, load provider/api_key/api_base/proxy from this saved config",
+    )
+
+
+class LLMFetchedModel(BaseModel):
+    """A single model returned by a provider's /models endpoint."""
+    id: str
+    owned_by: str | None = None
+    created: int | None = None
+
+
+class LLMModelsFetchResponse(BaseModel):
+    success: bool
+    models: list[LLMFetchedModel] = Field(default_factory=list)
+    count: int = 0
+    message: str
+    cached: bool = False
+    latency_ms: int = 0
+
+
 class LLMProviderModel(BaseModel):
     id: str
     name: str
@@ -188,6 +224,7 @@ class LLMPreset(BaseModel):
     requires_api_key: bool
     supports_custom_base: bool
     default_base_url: str | None = None
+    category: str = "major"
     models: list[LLMPresetModel]
 
 
@@ -198,3 +235,5 @@ class LLMPresetsResponse(BaseModel):
 class LLMConfigListResponse(BaseModel):
     configs: list[LLMConfigRead]
     active_id: str | None = None
+    vision_id: str | None = None
+    image_gen_id: str | None = None

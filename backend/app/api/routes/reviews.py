@@ -114,6 +114,10 @@ def run_review(
     project = _get_project_or_404(project_id, db)
     draft = _get_draft_for_project_or_404(project_id, payload.draft_id, db)
     task = create_task("review-draft")
+    # 归属本次运行的 LLM 调用到 task/project（token 统计）
+    from app.services.llm_service import clear_task_context, set_task_context
+
+    set_task_context(task.task_id, project_id)
     try:
         cards = list(db.scalars(select(EvidenceCard).where(EvidenceCard.project_id == project_id)).all())
         issue_payloads, review_metrics = review_draft_with_metrics(
@@ -167,6 +171,8 @@ def run_review(
         db.rollback()
         _fail_task_for_exception(task.task_id, exc)
         raise
+    finally:
+        clear_task_context()
 
 
 @router.post("/projects/{project_id}/revise-draft")
@@ -176,6 +182,9 @@ def run_revision(
     project = _get_project_or_404(project_id, db)
     draft = _get_draft_for_project_or_404(project_id, payload.draft_id, db)
     task = create_task("revise-draft")
+    from app.services.llm_service import clear_task_context, set_task_context
+
+    set_task_context(task.task_id, project_id)
     try:
         issues = list(
             db.scalars(
@@ -237,3 +246,5 @@ def run_revision(
         db.rollback()
         _fail_task_for_exception(task.task_id, exc)
         raise
+    finally:
+        clear_task_context()
