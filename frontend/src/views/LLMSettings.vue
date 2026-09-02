@@ -1,11 +1,30 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, nextTick, onMounted, ref } from "vue";
 import DOMPurify from "dompurify";
 import { apiRequest } from "../api";
-import type { LLMConfig, LLMConfigListResponse, LLMPreset, LLMProviderModel, LLMTestResult } from "../types";
+import ModelCombobox from "../components/ModelCombobox.vue";
+import type {
+  LLMConfig,
+  LLMConfigListResponse,
+  LLMPreset,
+  LLMProviderModel,
+  LLMTestResult,
+  LLMModelsFetchResponse,
+  LLMFetchedModel,
+} from "../types";
+
+type ModelOption = { id: string; label: string };
+
+const CATEGORY_LABELS: Record<string, string> = {
+  major: "主流厂商",
+  marketplace: "中转市场",
+  local: "本地 / 自定义",
+};
 
 const configs = ref<LLMConfig[]>([]);
 const activeId = ref<string | null>(null);
+const visionId = ref<string | null>(null);
+const imageGenId = ref<string | null>(null);
 const presets = ref<LLMPreset[]>([]);
 const loading = ref(false);
 const error = ref("");
@@ -15,6 +34,8 @@ const success = ref("");
 const showAddModal = ref(false);
 const addStep = ref(1);
 const selectedPresetId = ref("");
+const presetCategory = ref<string>("major");
+const presetSearch = ref("");
 const addForm = ref({
   name: "",
   provider: "",
@@ -30,11 +51,19 @@ const addForm = ref({
   enable_reasoning: true,
   preferred_max_tokens: null as number | null,
 });
+const addFetchedModels = ref<LLMFetchedModel[]>([]);
+const addFetchingModels = ref(false);
+// After a successful "刷新在线模型列表" the dropdown must open by itself -
+// otherwise nothing visibly changes and the fetched list looks missing.
+const addCombobox = ref<InstanceType<typeof ModelCombobox> | null>(null);
 
 // Edit modal state
 const showEditModal = ref(false);
 const editForm = ref<Partial<LLMConfig>>({});
 const editingId = ref("");
+const editFetchedModels = ref<LLMFetchedModel[]>([]);
+const editFetchingModels = ref(false);
+const editCombobox = ref<InstanceType<typeof ModelCombobox> | null>(null);
 
 // Test states per config
 const testStates = ref<Record<string, { loading: boolean; result?: LLMTestResult }>>({});
@@ -47,6 +76,85 @@ const availableModels = computed<LLMProviderModel[]>(() => {
   return selectedPreset.value?.models ?? [];
 });
 
+const existingProviderIds = computed(() => new Set(configs.value.map((c) => c.provider)));
+
+const categoryCounts = computed(() => {
+  const counts: Record<string, number> = { major: 0, marketplace: 0, local: 0 };
+  for (const p of presets.value) counts[p.category] = (counts[p.category] || 0) + 1;
+  return counts;
+});
+
+const filteredPresets = computed<LLMPreset[]>(() => {
+  const q = presetSearch.value.trim().toLowerCase();
+  return presets.value.filter((p) => {
+    if (p.category !== presetCategory.value) return false;
+    if (!q) return true;
+    return (
+      p.name.toLowerCase().includes(q) ||
+      p.id.toLowerCase().includes(q) ||
+      (p.description || "").toLowerCase().includes(q)
+    );
+  });
+});
+
+function buildModelOptions(
+  known: LLMProviderModel[],
+  fetched: LLMFetchedModel[],
+  current: string
+): ModelOption[] {
+  const opts: ModelOption[] = [];
+  const seen = new Set<string>();
+  const knownIds = new Set(known.map((m) => m.id));
+  // Newly fetched models that aren't in the preset list go first, so a refresh
+  // visibly changes the dropdown even before the user expands it.
+  for (const m of fetched) {
+    if (!knownIds.has(m.id) && !seen.has(m.id)) {
+      seen.add(m.id);
+      opts.push({ id: m.id, label: `${m.id}（在线）` });
+    }
+  }
+  for (const m of known) {
+    if (!seen.has(m.id)) {
+      seen.add(m.id);
+      opts.push({ id: m.id, label: m.description ? `${m.name} - ${m.description}` : m.name });
+    }
+  }
+  if (current && !seen.has(current)) {
+    opts.push({ id: current, label: `${current}（自定义）` });
+  }
+  return opts;
+}
+
+// Deduped fetched models feed straight into the combobox options.
+const addModelText = computed({
+  get: () => addForm.value.model,
+  set: (v: string) => {
+    addForm.value.model = v;
+  },
+});
+const editModelText = computed({
+  get: () => (editForm.value.model as string) || "",
+  set: (v: string) => {
+    editForm.value.model = v;
+  },
+});
+
+const addModelOptions = computed(() =>
+  buildModelOptions(availableModels.value, addFetchedModels.value, addForm.value.model)
+);
+
+const editPreset = computed<LLMPreset | undefined>(() =>
+  presets.value.find((p) => p.id === editForm.value.provider)
+);
+
+const editModelOptions = computed(() =>
+  buildModelOptions(
+    editPreset.value?.models ?? [],
+    editFetchedModels.value,
+    (editForm.value.model as string) || ""
+  )
+);
+
 async function load() {
   loading.value = true;
   error.value = "";
@@ -54,6 +162,8 @@ async function load() {
     const data = await apiRequest<LLMConfigListResponse>("/api/llm/configs");
     configs.value = data.configs;
     activeId.value = data.active_id;
+    visionId.value = data.vision_id;
+    imageGenId.value = data.image_gen_id;
   } catch (err) {
     error.value = err instanceof Error ? err.message : "加载失败";
   } finally {
@@ -73,6 +183,9 @@ async function loadPresets() {
 function openAddModal() {
   addStep.value = 1;
   selectedPresetId.value = "";
+  presetCategory.value = "major";
+  presetSearch.value = "";
+  addFetchedModels.value = [];
   addForm.value = {
     name: "",
     provider: "",
@@ -100,11 +213,44 @@ function selectPreset(presetId: string) {
     addForm.value.model = preset.models[0]?.id ?? "";
     addForm.value.api_base = preset.default_base_url ?? "";
   }
+  addFetchedModels.value = [];
   addStep.value = 2;
 }
 
 function goBackToPresetSelect() {
   addStep.value = 1;
+}
+
+async function fetchModelsForAdd() {
+  if (!addForm.value.provider) return;
+  addFetchingModels.value = true;
+  error.value = "";
+  try {
+    const data = await apiRequest<LLMModelsFetchResponse>("/api/llm/models-fetch", {
+      method: "POST",
+      body: JSON.stringify({
+        provider: addForm.value.provider,
+        api_key: addForm.value.api_key || null,
+        api_base: addForm.value.api_base || null,
+        proxy_url: addForm.value.proxy_url || null,
+        timeout: 15,
+      }),
+    });
+    if (data.success && data.models.length) {
+      addFetchedModels.value = data.models;
+      success.value = data.message;
+      // options are computed - wait a tick, then open the panel with the
+      // text filter cleared so the online list is immediately visible.
+      await nextTick();
+      addCombobox.value?.openPanel(true);
+    } else {
+      error.value = data.message || "拉取模型列表失败";
+    }
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : "拉取失败";
+  } finally {
+    addFetchingModels.value = false;
+  }
 }
 
 async function saveNewConfig() {
@@ -135,6 +281,30 @@ async function activateConfig(configId: string) {
   }
 }
 
+async function toggleVisionConfig(configId: string) {
+  error.value = "";
+  try {
+    const data = await apiRequest<LLMConfig>(`/api/llm/configs/${configId}/vision`, { method: "POST" });
+    visionId.value = data.is_vision ? configId : null;
+    success.value = data.is_vision ? "已设为视觉模型（用于配图识别）" : "已取消视觉模型";
+    await load();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : "设置失败";
+  }
+}
+
+async function toggleImageGenConfig(configId: string) {
+  error.value = "";
+  try {
+    const data = await apiRequest<LLMConfig>(`/api/llm/configs/${configId}/image-gen`, { method: "POST" });
+    imageGenId.value = data.is_image_gen ? configId : null;
+    success.value = data.is_image_gen ? "已设为生图模型（找不到合适配图时自动生成）" : "已取消生图模型";
+    await load();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : "设置失败";
+  }
+}
+
 async function deleteConfig(configId: string) {
   if (!confirm("确定删除此配置？")) return;
   error.value = "";
@@ -149,8 +319,49 @@ async function deleteConfig(configId: string) {
 
 function openEditModal(config: LLMConfig) {
   editingId.value = config.id;
-  editForm.value = { ...config };
+  // The list endpoint returns a MASKED api_key (sk-1****abcd). Don't feed that
+  // back into the form - show an empty field with the "留空则保持原值"
+  // placeholder instead, so saving without retyping keeps the stored key
+  // (the backend also rejects masked/empty values defensively).
+  editForm.value = { ...config, api_key: "" };
+  editFetchedModels.value = [];
   showEditModal.value = true;
+}
+
+async function fetchModelsForEdit() {
+  if (!editingId.value) return;
+  editFetchingModels.value = true;
+  error.value = "";
+  try {
+    // Send config_id so the backend fills in provider/base/proxy from the
+    // saved config, but pass the typed api_key/api_base when present so the
+    // user can verify a freshly entered key WITHOUT saving first (the saved
+    // key may be the masked/invalid one). An empty api_key falls back to the
+    // stored key server-side.
+    const data = await apiRequest<LLMModelsFetchResponse>("/api/llm/models-fetch", {
+      method: "POST",
+      body: JSON.stringify({
+        provider: editForm.value.provider,
+        config_id: editingId.value,
+        api_key: editForm.value.api_key || null,
+        api_base: editForm.value.api_base || null,
+        proxy_url: editForm.value.proxy_url || null,
+        timeout: 15,
+      }),
+    });
+    if (data.success && data.models.length) {
+      editFetchedModels.value = data.models;
+      success.value = data.message;
+      await nextTick();
+      editCombobox.value?.openPanel(true);
+    } else {
+      error.value = data.message || "拉取模型列表失败";
+    }
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : "拉取失败";
+  } finally {
+    editFetchingModels.value = false;
+  }
 }
 
 async function saveEdit() {
@@ -201,6 +412,10 @@ function latencyLabel(ms: number): string {
   return "较慢";
 }
 
+function baseSummary(preset: LLMPreset): string {
+  return preset.default_base_url || (preset.supports_custom_base ? "自定义 base URL" : "—");
+}
+
 onMounted(() => {
   load();
   loadPresets();
@@ -212,7 +427,7 @@ onMounted(() => {
     <header class="hero card">
       <div>
         <h1>模型配置</h1>
-        <p>管理多个 LLM 提供商，一键切换、实时测速。</p>
+        <p>管理多个 LLM 提供商，一键切换、实时测速、在线拉取模型列表。</p>
       </div>
       <button class="primary" type="button" @click="openAddModal">+ 添加提供商</button>
     </header>
@@ -239,6 +454,8 @@ onMounted(() => {
           <div class="status-dot" :class="{ on: config.id === activeId }" :aria-label="config.id === activeId ? '已启用' : '未启用'" />
           <h3>{{ config.name }}</h3>
           <span class="provider-tag">{{ config.provider }}</span>
+          <span v-if="config.id === visionId" class="vision-tag" title="用于配图识别等图像理解调用">视觉模型</span>
+          <span v-if="config.id === imageGenId" class="vision-tag imggen" title="找不到合适论文图表时用该配置自动生成配图">生图模型</span>
         </div>
 
         <div class="card-body">
@@ -274,6 +491,26 @@ onMounted(() => {
           <button
             type="button"
             class="ghost-btn"
+            :class="{ 'vision-on': config.id === visionId }"
+            :title="config.id === visionId ? '取消后图像调用回退到生效配置' : '配图识别等图像调用走此配置'"
+            @click="toggleVisionConfig(config.id)"
+          >
+            {{ config.id === visionId ? "取消视觉" : "设为视觉" }}
+          </button>
+
+          <button
+            type="button"
+            class="ghost-btn"
+            :class="config.id === imageGenId ? 'imggen-on' : ''"
+            :title="config.id === imageGenId ? '取消后回退到 Pollinations 免费生图' : '找不到合适配图时用此配置生成插图（需为文生图模型，如 SiliconFlow/Kwai Kolors、智谱 CogView 等）'"
+            @click="toggleImageGenConfig(config.id)"
+          >
+            {{ config.id === imageGenId ? "取消生图" : "设为生图" }}
+          </button>
+
+          <button
+            type="button"
+            class="ghost-btn"
             :disabled="testStates[config.id]?.loading"
             @click="testConfig(config)"
           >
@@ -300,17 +537,38 @@ onMounted(() => {
           </header>
 
           <div v-if="addStep === 1" class="modal-body">
-            <p class="hint">选择预设提供商，系统将自动填入默认参数。</p>
-            <div class="preset-grid">
+            <div class="preset-toolbar">
+              <div class="preset-tabs">
+                <button
+                  v-for="cat in ['major', 'marketplace', 'local']"
+                  :key="cat"
+                  type="button"
+                  class="preset-tab"
+                  :class="{ active: presetCategory === cat }"
+                  @click="presetCategory = cat"
+                >
+                  {{ CATEGORY_LABELS[cat] }} ({{ categoryCounts[cat] || 0 }})
+                </button>
+              </div>
+              <input v-model="presetSearch" class="preset-search" type="search" placeholder="搜索供应商…" />
+            </div>
+
+            <div v-if="filteredPresets.length === 0" class="preset-empty">没有匹配的供应商</div>
+            <div v-else class="preset-grid">
               <button
-                v-for="preset in presets"
+                v-for="preset in filteredPresets"
                 :key="preset.id"
                 type="button"
                 class="preset-card"
+                :class="{ added: existingProviderIds.has(preset.id) }"
                 @click="selectPreset(preset.id)"
               >
-                <span class="preset-icon" v-html="DOMPurify.sanitize(preset.logo_svg)" />
-                <span class="preset-name">{{ preset.name }}</span>
+                <span class="preset-top">
+                  <span class="preset-icon" v-html="DOMPurify.sanitize(preset.logo_svg)" />
+                  <span class="preset-name">{{ preset.name }}</span>
+                  <span v-if="existingProviderIds.has(preset.id)" class="preset-added-badge">已添加</span>
+                </span>
+                <span class="preset-base">{{ baseSummary(preset) }}</span>
                 <span class="preset-desc">{{ preset.description }}</span>
               </button>
             </div>
@@ -321,14 +579,23 @@ onMounted(() => {
 
             <div class="field">
               <label for="add-name">配置名称</label>
-              <input id="add-name" v-model="addForm.name" type="text" placeholder="例如：我的 DeepSeek" />
+              <input id="add-name" v-model="addForm.name" type="text" autocomplete="off" placeholder="例如：我的 DeepSeek" />
             </div>
 
             <div class="field">
-              <label for="add-model">模型</label>
-              <select id="add-model" v-model="addForm.model">
-                <option v-for="m in availableModels" :key="m.id" :value="m.id">{{ m.name }} — {{ m.description }}</option>
-              </select>
+              <label for="add-model">
+                模型
+                <button
+                  type="button"
+                  class="inline-link"
+                  :disabled="addFetchingModels || !addForm.provider"
+                  @click="fetchModelsForAdd"
+                >
+                  <span v-if="addFetchingModels" class="spinner" />
+                  {{ addFetchingModels ? "拉取中…" : "刷新在线模型列表" }}
+                </button>
+              </label>
+              <ModelCombobox id="add-model" ref="addCombobox" v-model="addModelText" :options="addModelOptions" />
             </div>
 
             <div class="field">
@@ -336,7 +603,8 @@ onMounted(() => {
                 API Key
                 <span v-if="selectedPreset && !selectedPreset.requires_api_key" class="optional">（可选）</span>
               </label>
-              <input id="add-api-key" v-model="addForm.api_key" type="password" placeholder="sk-..." />
+              <!-- autocomplete="new-password" 阻止 Edge 把"文本框+密码框"当登录表单弹"保存密码"浮层 —— 该原生浮层正好盖住下方的模型下拉面板 -->
+              <input id="add-api-key" v-model="addForm.api_key" type="password" autocomplete="new-password" placeholder="sk-..." />
             </div>
 
             <div v-if="selectedPreset?.supports_custom_base" class="field">
@@ -405,17 +673,29 @@ onMounted(() => {
           <div class="modal-body">
             <div class="field">
               <label for="edit-name">配置名称</label>
-              <input id="edit-name" v-model="editForm.name" type="text" />
+              <input id="edit-name" v-model="editForm.name" type="text" autocomplete="off" />
             </div>
 
             <div class="field">
-              <label for="edit-model">模型</label>
-              <input id="edit-model" v-model="editForm.model" type="text" />
+              <label for="edit-model">
+                模型
+                <button
+                  type="button"
+                  class="inline-link"
+                  :disabled="editFetchingModels"
+                  @click="fetchModelsForEdit"
+                >
+                  <span v-if="editFetchingModels" class="spinner" />
+                  {{ editFetchingModels ? "拉取中…" : "刷新在线模型列表" }}
+                </button>
+              </label>
+              <ModelCombobox id="edit-model" ref="editCombobox" v-model="editModelText" :options="editModelOptions" />
             </div>
 
             <div class="field">
               <label for="edit-api-key">API Key</label>
-              <input id="edit-api-key" v-model="editForm.api_key" type="password" placeholder="留空则保持原值" />
+              <!-- 同上：防止 Edge 保存密码浮层遮挡模型下拉 -->
+              <input id="edit-api-key" v-model="editForm.api_key" type="password" autocomplete="new-password" placeholder="留空则保持原值" />
             </div>
 
             <div class="field">
@@ -614,6 +894,7 @@ button.secondary {
 .model-line .value {
   color: #1f2937;
   font-weight: 500;
+  word-break: break-all;
 }
 
 .test-result {
@@ -670,6 +951,32 @@ button.secondary {
   padding: 0.4rem 0.6rem;
 }
 
+.vision-tag {
+  font-size: 0.72rem;
+  color: #6d28d9;
+  background: #ede9fe;
+  border: 1px solid #ddd6fe;
+  border-radius: 999px;
+  padding: 0.1rem 0.55rem;
+  white-space: nowrap;
+}
+
+.vision-tag.imggen {
+  color: #b45309;
+  background: #fef3c7;
+  border-color: #fde68a;
+}
+
+.ghost-btn.vision-on {
+  color: #6d28d9;
+  background: #ede9fe;
+}
+
+.ghost-btn.imggen-on {
+  color: #b45309;
+  background: #fef3c7;
+}
+
 .ghost-btn {
   color: var(--accent-strong);
   background: var(--accent-light);
@@ -712,6 +1019,7 @@ button.secondary {
   border-top-color: currentColor;
   border-radius: 50%;
   animation: spin 700ms linear infinite;
+  vertical-align: middle;
 }
 
 .toast {
@@ -794,12 +1102,6 @@ button.secondary {
   border-top: 1px solid #e5e7eb;
 }
 
-.hint {
-  margin: 0;
-  color: #576583;
-  font-size: 0.9rem;
-}
-
 .back-link {
   background: transparent;
   color: var(--accent);
@@ -808,19 +1110,79 @@ button.secondary {
   text-align: left;
 }
 
+.inline-link {
+  margin-left: auto;
+  background: transparent;
+  color: var(--accent);
+  padding: 0;
+  font-size: 0.82rem;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.preset-toolbar {
+  display: flex;
+  gap: 0.8rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.preset-tabs {
+  display: flex;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+}
+
+.preset-tab {
+  background: #f1f3f8;
+  color: #576583;
+  padding: 0.35rem 0.7rem;
+  font-size: 0.84rem;
+  border-radius: 8px;
+}
+
+.preset-tab.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.preset-search {
+  margin-left: auto;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.9rem;
+  min-width: 180px;
+  background: #fff;
+}
+
+.preset-search:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(13, 124, 117, 0.1);
+}
+
+.preset-empty {
+  text-align: center;
+  color: #6b7280;
+  padding: 2rem 0;
+}
+
 .preset-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
   gap: 0.7rem;
 }
 
 .preset-card {
   display: grid;
-  gap: 0.35rem;
+  gap: 0.3rem;
   text-align: left;
   border: 1px solid #d9dfeb;
   border-radius: var(--radius-md);
-  padding: 0.9rem;
+  padding: 0.85rem;
   background: #f7f9fc;
   cursor: pointer;
   transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
@@ -831,10 +1193,22 @@ button.secondary {
   border-color: var(--accent-muted);
 }
 
+.preset-card.added {
+  border-color: rgba(26, 122, 76, 0.4);
+  background: #f4fcf9;
+}
+
+.preset-top {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
 .preset-icon {
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   color: var(--accent);
+  flex-shrink: 0;
 }
 
 .preset-icon :deep(svg) {
@@ -844,13 +1218,35 @@ button.secondary {
 
 .preset-name {
   font-weight: 600;
-  font-size: 0.96rem;
+  font-size: 0.92rem;
+  flex: 1;
+  word-break: break-word;
+}
+
+.preset-added-badge {
+  font-size: 0.66rem;
+  color: var(--success);
+  background: var(--success-light);
+  padding: 0.1rem 0.4rem;
+  border-radius: 5px;
+  flex-shrink: 0;
+}
+
+.preset-base {
+  font-size: 0.72rem;
+  color: #7a8699;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  word-break: break-all;
 }
 
 .preset-desc {
-  font-size: 0.78rem;
+  font-size: 0.76rem;
   color: #55637e;
   line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .field {
@@ -883,6 +1279,7 @@ button.secondary {
 .field input[type="password"],
 .field input[type="url"],
 .field input[type="number"],
+.field input[type="search"],
 .field select {
   border: 1px solid #d1d5db;
   border-radius: 10px;
@@ -905,6 +1302,10 @@ button.secondary {
   accent-color: var(--accent);
 }
 
+.model-chip-active:hover {
+  color: #fff;
+}
+
 .field-row {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -922,6 +1323,12 @@ button.secondary {
 
   .preset-grid {
     grid-template-columns: repeat(2, 1fr);
+  }
+
+  .preset-search {
+    margin-left: 0;
+    min-width: 0;
+    width: 100%;
   }
 }
 

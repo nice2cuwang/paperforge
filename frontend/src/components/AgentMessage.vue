@@ -1,6 +1,10 @@
 <script setup lang="ts">
-import { computed } from "vue";
-import type { ChatMessage } from "../types";
+import { computed, ref } from "vue";
+import { useRoute } from "vue-router";
+import { apiRequest } from "../api";
+import type { ChatMessage, LlmCallDetail } from "../types";
+
+const route = useRoute();
 
 const props = defineProps<{
   message: ChatMessage;
@@ -113,6 +117,43 @@ function formatEvidenceData(): string {
   if (!data) return props.message.text;
   return `生成 ${data.count ?? 0} 张证据卡。`;
 }
+
+/* ── LLM 调用透明化 ──────────────────────────────── */
+const llmDetail = ref<LlmCallDetail | null>(null);
+const llmLoading = ref(false);
+const llmError = ref("");
+
+async function toggleLlmDetail() {
+  const call = props.message.data as { id?: string } | undefined;
+  const projectId = String(route.params.projectId || "");
+  if (!call?.id || !projectId) return;
+  if (llmDetail.value) {
+    llmDetail.value = null;
+    return;
+  }
+  llmLoading.value = true;
+  llmError.value = "";
+  try {
+    llmDetail.value = await apiRequest<LlmCallDetail>(
+      `/api/projects/${projectId}/llm-calls/${call.id}`
+    );
+  } catch (err) {
+    llmError.value = err instanceof Error ? err.message : "加载失败";
+  } finally {
+    llmLoading.value = false;
+  }
+}
+
+function formatLlmLatency(ms: number | null | undefined): string {
+  if (ms == null) return "";
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatTokens(n: number | null | undefined): string {
+  if (n == null) return "—";
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
 </script>
 
 <template>
@@ -167,6 +208,53 @@ function formatEvidenceData(): string {
         <!-- Debate real-time messages -->
         <template v-else-if="message.type === 'debate'">
           <p class="debate-text">{{ debateParsed.content }}</p>
+        </template>
+
+        <!-- LLM call transparency card -->
+        <template v-else-if="message.type === 'llm_call'">
+          <button class="llm-call-card" type="button" @click="toggleLlmDetail">
+            <span class="llm-purpose">{{ message.data?.purpose || 'LLM 调用' }}</span>
+            <span class="llm-meta">
+              <span v-if="message.data?.model" class="llm-model">{{ message.data.model }}</span>
+              <span class="llm-tokens">
+                ↑{{ formatTokens(message.data?.prompt_tokens as number) }}
+                ↓{{ formatTokens(message.data?.completion_tokens as number) }}
+              </span>
+              <span class="llm-latency">{{ formatLlmLatency(message.data?.latency_ms as number) }}</span>
+              <span v-if="message.data?.error" class="llm-error">失败</span>
+            </span>
+            <span class="llm-toggle">{{ llmDetail ? '收起' : '展开全文' }}</span>
+          </button>
+
+          <!-- 直接展示发给模型的数据与模型回复（无需展开即可读） -->
+          <div v-if="String(message.data?.user_prompt_preview ?? '').trim()" class="llm-preview-block">
+            <span class="llm-preview-label">发给模型</span>
+            <p class="llm-preview-text prompt">{{ message.data?.user_prompt_preview }}</p>
+          </div>
+          <div v-if="String(message.data?.response_preview ?? '').trim() || message.data?.error" class="llm-preview-block">
+            <span class="llm-preview-label">模型回复</span>
+            <p class="llm-preview-text response">
+              {{ message.data?.response_preview || message.data?.error || '（空）' }}
+            </p>
+          </div>
+
+          <p v-if="llmLoading" class="llm-status">加载调用详情…</p>
+          <p v-if="llmError" class="llm-status error">{{ llmError }}</p>
+
+          <div v-if="llmDetail" class="llm-detail">
+            <details open class="llm-section">
+              <summary>System Prompt（{{ (llmDetail.system_prompt || '').length }} 字符）</summary>
+              <pre class="llm-text">{{ llmDetail.system_prompt || '（空）' }}</pre>
+            </details>
+            <details class="llm-section">
+              <summary>User Prompt（{{ (llmDetail.user_prompt || '').length }} 字符）</summary>
+              <pre class="llm-text">{{ llmDetail.user_prompt || '（空）' }}</pre>
+            </details>
+            <details class="llm-section">
+              <summary>模型响应（{{ (llmDetail.response || '').length }} 字符）</summary>
+              <pre class="llm-text">{{ llmDetail.response || llmDetail.error || '（空）' }}</pre>
+            </details>
+          </div>
         </template>
 
         <!-- Review issues -->
@@ -457,6 +545,151 @@ function formatEvidenceData(): string {
   font-size: 0.88rem !important;
   line-height: 1.55;
   color: var(--ink-soft, #2a3550) !important;
+}
+
+/* ── LLM call transparency card ── */
+.llm-call-card {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+  width: 100%;
+  text-align: left;
+  border: 1px dashed var(--line, #d4dbe8);
+  border-radius: 10px;
+  background: rgba(21, 29, 46, 0.02);
+  padding: 0.45rem 0.65rem;
+  cursor: pointer;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+
+.llm-call-card:hover {
+  border-color: var(--accent-muted, #b8ded6);
+  background: var(--accent-light, #e0f5f0);
+}
+
+.llm-purpose {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--ink, #151d2e);
+}
+
+.llm-meta {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  font-size: 0.72rem;
+  color: var(--muted, #627191);
+  flex: 1;
+  flex-wrap: wrap;
+}
+
+.llm-model {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.7rem;
+  background: rgba(21, 29, 46, 0.05);
+  border-radius: 5px;
+  padding: 0.08rem 0.35rem;
+}
+
+.llm-latency {
+  font-variant-numeric: tabular-nums;
+}
+
+.llm-error {
+  color: var(--danger, #b42318);
+  font-weight: 600;
+}
+
+.llm-toggle {
+  font-size: 0.74rem;
+  color: var(--accent, #0d7c75);
+  white-space: nowrap;
+  margin-left: auto;
+}
+
+/* 直接可见的 prompt/响应预览 */
+.llm-preview-block {
+  margin-top: 0.45rem;
+  display: grid;
+  gap: 0.15rem;
+}
+
+.llm-preview-label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--muted-soft, #8b96ad);
+}
+
+.llm-preview-text {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--ink-soft, #2a3550);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: hidden;
+  display: -webkit-box;
+  padding: 0.35rem 0.5rem;
+  border-radius: 6px;
+  border-left: 2px solid var(--line, #d4dbe8);
+  background: rgba(21, 29, 46, 0.02);
+}
+
+.llm-preview-text.prompt {
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+
+.llm-preview-text.response {
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  border-left-color: var(--accent-muted, #b8ded6);
+  background: var(--accent-light, #e0f5f0);
+}
+
+.llm-status {
+  margin: 0.4rem 0 0;
+  font-size: 0.8rem;
+  color: var(--muted, #627191);
+}
+
+.llm-status.error {
+  color: var(--danger, #b42318);
+}
+
+.llm-detail {
+  margin-top: 0.5rem;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.llm-section summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--accent-strong, #09625c);
+  user-select: none;
+  padding: 0.15rem 0;
+}
+
+.llm-section summary:hover {
+  text-decoration: underline;
+}
+
+.llm-text {
+  margin: 0.3rem 0 0.45rem;
+  padding: 0.6rem 0.7rem;
+  border-radius: 8px;
+  background: #f6f8fb;
+  border: 1px solid #e4e9f1;
+  font: 400 0.76rem/1.55 var(--font-mono, monospace);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 280px;
+  overflow-y: auto;
+  color: #2a3550;
 }
 
 @media (max-width: 760px) {

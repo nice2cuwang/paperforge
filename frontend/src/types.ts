@@ -13,6 +13,42 @@ export type Project = {
   updated_at: string;
 };
 
+/* ── Token 用量统计 ─────────────────────────────── */
+
+export type TokenUsageByModel = {
+  provider: string;
+  model: string;
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+};
+
+export type TokenUsageByTask = {
+  task_id: string | null;
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  first_call_at: string | null;
+  last_call_at: string | null;
+};
+
+export type ProjectTokenUsage = {
+  project_id: string;
+  total_calls: number;
+  failed_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  total_latency_ms: number;
+  avg_latency_ms: number;
+  first_call_at: string | null;
+  last_call_at: string | null;
+  by_model: TokenUsageByModel[];
+  by_task: TokenUsageByTask[];
+};
+
 export type Paper = {
   id: string;
   project_id: string;
@@ -151,6 +187,8 @@ export type LLMConfig = {
   enable_reasoning: boolean;
   preferred_max_tokens: number | null;
   is_active: boolean;
+  is_vision: boolean;
+  is_image_gen: boolean;
   created_at: string | null;
   updated_at: string | null;
 };
@@ -163,12 +201,15 @@ export type LLMPreset = {
   requires_api_key: boolean;
   supports_custom_base: boolean;
   default_base_url: string | null;
+  category: string;
   models: LLMProviderModel[];
 };
 
 export type LLMConfigListResponse = {
   configs: LLMConfig[];
   active_id: string | null;
+  vision_id: string | null;
+  image_gen_id: string | null;
 };
 
 export type LLMTestResult = {
@@ -177,6 +218,21 @@ export type LLMTestResult = {
   message: string;
   model: string | null;
   usage: Record<string, unknown> | null;
+};
+
+export type LLMFetchedModel = {
+  id: string;
+  owned_by: string | null;
+  created: number | null;
+};
+
+export type LLMModelsFetchResponse = {
+  success: boolean;
+  models: LLMFetchedModel[];
+  count: number;
+  message: string;
+  cached: boolean;
+  latency_ms: number;
 };
 
 /* ── Chat-first types ─────────────────────────────── */
@@ -193,7 +249,37 @@ export type ChatMessageType =
   | "command"
   | "export"
   | "progress"
-  | "debate";
+  | "debate"
+  | "llm_call";
+
+export type LlmCallSummary = {
+  id: string;
+  task_id: string | null;
+  purpose: string | null;
+  model: string;
+  provider: string;
+  latency_ms: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  error: string | null;
+  created_at: string | null;
+  system_prompt_preview: string;
+  user_prompt_preview: string;
+  response_preview: string;
+};
+
+export type LlmCallDetail = {
+  id: string;
+  purpose: string | null;
+  model: string;
+  provider: string;
+  system_prompt: string | null;
+  user_prompt: string | null;
+  response: string | null;
+  latency_ms: number;
+  usage: Record<string, unknown> | null;
+  error: string | null;
+};
 
 export type ChatMessage = {
   id: string;

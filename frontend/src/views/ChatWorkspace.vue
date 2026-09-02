@@ -10,6 +10,7 @@ import type {
   ChatMessage,
   Draft,
   EvidenceCard,
+  LlmCallSummary,
   Paper,
   Project,
   ReviewIssue,
@@ -124,6 +125,58 @@ function pushDebateMessage(logText: string) {
   pushMessage("review", "debate", cleanText);
 }
 
+/* ── LLM 调用透明化 ────────────────────────────────
+   轮询任务期间拉取该项目新产生的 LLM 调用记录，以"团队成员正在工作"
+   的卡片形式流式插入对话，让用户看到系统发给模型的每一条数据。 */
+const _seenLlmCallIds = new Set<string>();
+
+const PURPOSE_AGENT: Record<string, ChatMessage["agent"]> = {
+  "写作": "writing",
+  "摘要": "writing",
+  "大纲": "writing",
+  "论点提炼": "writing",
+  "修订": "editor",
+  "审稿": "review",
+  "辩论": "review",
+  "话题评估": "research",
+  "检索": "research",
+  "证据": "evidence",
+  "配图": "evidence",
+  "图表": "evidence",
+};
+
+async function streamLlmCalls() {
+  try {
+    const calls = await apiRequest<LlmCallSummary[]>(
+      `/api/projects/${projectId.value}/llm-calls?limit=200`
+    );
+    // 按时间正序展示新调用
+    const fresh = calls
+      .filter((c) => !_seenLlmCallIds.has(c.id))
+      .sort((a, b) => (a.created_at ?? "").localeCompare(b.created_at ?? ""));
+    for (const call of fresh) {
+      _seenLlmCallIds.add(call.id);
+      const agent = PURPOSE_AGENT[call.purpose ?? ""] ?? "system";
+      pushMessage(agent, "llm_call", call.purpose ?? "LLM 调用", { ...call });
+    }
+    // 首次载入只标记不刷屏：恢复历史时不回放全部旧调用
+    if (_seenLlmCallIds.size > 0 && fresh.length === 0) return;
+  } catch {
+    // 静默失败：透明化是增强功能，不阻塞主流程
+  }
+}
+
+async function loadExistingLlmCallIds() {
+  try {
+    const calls = await apiRequest<LlmCallSummary[]>(
+      `/api/projects/${projectId.value}/llm-calls?limit=200`
+    );
+    for (const c of calls) _seenLlmCallIds.add(c.id);
+  } catch {
+    // ignore
+  }
+}
+
 async function pollTask(taskId: string, maxMs = 30 * 60 * 1000, startLogIndex = 0): Promise<TaskPayload | null> {
   const start = Date.now();
   let lastProgress = -1;
@@ -142,6 +195,9 @@ async function pollTask(taskId: string, maxMs = 30 * 60 * 1000, startLogIndex = 
         }
         lastLogIndex = payload.logs.length;
       }
+
+      // ── LLM 调用透明化：每轮轮询拉取新产生的调用记录 ──
+      await streamLlmCalls();
 
       // Emit progress messages at meaningful intervals
       if (payload.progress !== lastProgress && payload.current_step) {
@@ -541,6 +597,8 @@ onMounted(async () => {
         // Pre-fetch to skip past existing debate logs (avoid re-emitting)
         const preTask = await apiRequest<TaskPayload>(`/api/tasks/${storedTaskId}`);
         const existingLogCount = preTask?.logs?.length ?? 0;
+        // 已完成的调用只标记不回放；轮询中产生的新调用照常流式展示
+        await loadExistingLlmCallIds();
         await pollTask(storedTaskId, 30 * 60 * 1000, existingLogCount);
         await loadAll();
       } catch {

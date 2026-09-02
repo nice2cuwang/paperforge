@@ -10,6 +10,7 @@ import type {
   EvidenceCard,
   Paper,
   Project,
+  ProjectTokenUsage,
   ReviewIssue,
   TaskPayload
 } from "../types";
@@ -25,9 +26,28 @@ const drafts = ref<Draft[]>([]);
 const issues = ref<ReviewIssue[]>([]);
 const task = ref<TaskPayload | null>(null);
 const autoWorkflow = ref<AutoWorkflowResult | null>(null);
+const tokenUsage = ref<ProjectTokenUsage | null>(null);
 const error = ref("");
 const busy = ref(false);
 const workflowHint = ref("");
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+function fmtDuration(ms: number): string {
+  if (ms >= 3_600_000) return `${(ms / 3_600_000).toFixed(1)}h`;
+  if (ms >= 60_000) return `${(ms / 60_000).toFixed(1)}min`;
+  if (ms >= 1_000) return `${(ms / 1_000).toFixed(1)}s`;
+  return `${ms}ms`;
+}
+
+function fmtTime(iso: string | null): string {
+  if (!iso) return "";
+  return iso.replace("T", " ").slice(0, 16);
+}
 
 const workflowStages = [
   { threshold: 5, label: "检索", desc: "拉取候选论文并去重" },
@@ -55,6 +75,11 @@ async function loadAll() {
   evidence.value = await apiRequest<EvidenceCard[]>(`/api/projects/${id}/evidence`);
   drafts.value = await apiRequest<Draft[]>(`/api/projects/${id}/drafts`);
   issues.value = await apiRequest<ReviewIssue[]>(`/api/projects/${id}/review-issues`);
+  try {
+    tokenUsage.value = await apiRequest<ProjectTokenUsage>(`/api/projects/${id}/token-usage`);
+  } catch {
+    tokenUsage.value = null; // 统计失败不阻塞页面
+  }
 }
 
 const TASK_STORAGE_KEY = (pid: string) => `paperforge_task_${pid}`;
@@ -274,6 +299,10 @@ onMounted(async () => {
         <strong>{{ issues.length }}</strong>
         <span>审查问题</span>
       </div>
+      <div v-if="tokenUsage && tokenUsage.total_tokens > 0" class="stat-chip">
+        <strong>{{ fmtTokens(tokenUsage.total_tokens) }}</strong>
+        <span>Token 消耗</span>
+      </div>
     </div>
 
     <!-- ── Pipeline Visualization ── -->
@@ -367,6 +396,82 @@ onMounted(async () => {
       <button type="button" class="ghost-btn" @click="router.push(`/projects/${projectId}/final`)">
         查看终稿 &rarr;
       </button>
+    </section>
+
+    <!-- ── Token 用量 ── -->
+    <section v-if="tokenUsage && tokenUsage.total_calls > 0" class="card usage-card">
+      <h2>Token 消耗</h2>
+
+      <div class="usage-summary">
+        <div class="usage-stat">
+          <strong>{{ fmtTokens(tokenUsage.total_tokens) }}</strong>
+          <span>总 Token</span>
+        </div>
+        <div class="usage-stat">
+          <strong>{{ fmtTokens(tokenUsage.prompt_tokens) }}</strong>
+          <span>输入（prompt）</span>
+        </div>
+        <div class="usage-stat">
+          <strong>{{ fmtTokens(tokenUsage.completion_tokens) }}</strong>
+          <span>输出（completion）</span>
+        </div>
+        <div class="usage-stat">
+          <strong>{{ tokenUsage.total_calls }}</strong>
+          <span>调用次数</span>
+        </div>
+        <div class="usage-stat">
+          <strong>{{ fmtDuration(tokenUsage.total_latency_ms) }}</strong>
+          <span>累计耗时</span>
+        </div>
+      </div>
+
+      <h3 v-if="tokenUsage.by_model.length > 0">按模型</h3>
+      <table v-if="tokenUsage.by_model.length > 0" class="usage-table">
+        <thead>
+          <tr>
+            <th>模型</th>
+            <th>调用</th>
+            <th>输入</th>
+            <th>输出</th>
+            <th>合计</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="m in tokenUsage.by_model" :key="`${m.provider}/${m.model}`">
+            <td class="usage-model">
+              {{ m.model }}<small v-if="m.provider">{{ m.provider }}</small>
+            </td>
+            <td>{{ m.calls }}</td>
+            <td>{{ fmtTokens(m.prompt_tokens) }}</td>
+            <td>{{ fmtTokens(m.completion_tokens) }}</td>
+            <td>{{ fmtTokens(m.total_tokens) }}</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3 v-if="tokenUsage.by_task.length > 0">按运行批次</h3>
+      <table v-if="tokenUsage.by_task.length > 0" class="usage-table">
+        <thead>
+          <tr>
+            <th>批次</th>
+            <th>调用</th>
+            <th>合计 Token</th>
+            <th>时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="(t, idx) in tokenUsage.by_task" :key="t.task_id ?? `no-task-${idx}`">
+            <td class="usage-task">
+              {{ t.task_id ? `运行 ${t.task_id.slice(0, 8)}` : "未归属调用" }}
+            </td>
+            <td>{{ t.calls }}</td>
+            <td>{{ fmtTokens(t.total_tokens) }}</td>
+            <td class="usage-time">
+              {{ fmtTime(t.first_call_at) }}<template v-if="t.last_call_at && t.first_call_at !== t.last_call_at"> ~ {{ fmtTime(t.last_call_at) }}</template>
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </section>
 
     <p v-if="error" class="error-toast">{{ error }}</p>
@@ -764,6 +869,80 @@ button:disabled {
   font-size: 0.9rem;
   z-index: 200;
   animation: rise-in 200ms ease;
+}
+
+/* ── Token 用量 ── */
+.usage-card h3 {
+  margin: 1rem 0 0.4rem;
+  font-size: 0.92rem;
+  color: var(--muted);
+}
+
+.usage-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 0.6rem;
+}
+
+.usage-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.usage-stat strong {
+  font-size: 1.15rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-stat span {
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.86rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-table th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 0.76rem;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.usage-table td {
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.usage-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.usage-model {
+  display: flex;
+  flex-direction: column;
+}
+
+.usage-model small,
+.usage-task small {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.usage-time {
+  color: var(--muted);
+  font-size: 0.8rem;
 }
 
 @media (max-width: 950px) {

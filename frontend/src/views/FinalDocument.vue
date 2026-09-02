@@ -242,6 +242,10 @@ h2 {
   background: #fff;
   line-height: 1.75;
   color: #1f2937;
+  /* 长文在框内滚动，不把页面撑出屏幕 */
+  max-height: clamp(320px, calc(100vh - 26rem), 720px);
+  overflow-y: auto;
+  min-height: 320px;
 }
 
 .md-preview :deep(h1) { font-size: 1.6rem; margin: 0.8rem 0 0.4rem; }
@@ -267,6 +271,9 @@ pre {
   white-space: pre-wrap;
   word-break: break-word;
   font: 400 0.92rem/1.55 var(--font-mono);
+  max-height: clamp(320px, calc(100vh - 26rem), 720px);
+  overflow-y: auto;
+  min-height: 320px;
 }
 
 button {

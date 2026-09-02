@@ -116,7 +116,7 @@ onMounted(async () => {
             <button type="button" :class="{ active: previewMode === 'preview' }" @click="previewMode = 'preview'">预览</button>
           </div>
         </div>
-        <textarea v-if="previewMode === 'edit'" v-model="draftContent" rows="24" />
+        <textarea v-if="previewMode === 'edit'" v-model="draftContent" />
         <div v-else class="md-preview" v-html="renderedHtml" />
         <button type="button" :disabled="!activeDraft" @click="saveDraft">保存当前草稿</button>
       </div>
@@ -156,7 +156,7 @@ onMounted(async () => {
 .editor {
   display: grid;
   gap: 0.9rem;
-  grid-template-columns: 260px 1fr;
+  grid-template-columns: 260px minmax(0, 1fr);
 }
 
 .versions,
@@ -165,12 +165,16 @@ onMounted(async () => {
   border-radius: var(--radius-md);
   background: var(--surface);
   padding: 0.8rem;
+  min-width: 0;
 }
 
 .versions {
   display: grid;
   gap: 0.5rem;
   align-content: start;
+  /* 版本列表过长时在自身区域内滚动，不把页面撑高 */
+  max-height: calc(100vh - 16rem);
+  overflow-y: auto;
 }
 
 .version-item {
@@ -218,14 +222,15 @@ onMounted(async () => {
 }
 
 .md-preview {
-  min-height: 360px;
+  min-height: 300px;
+  max-height: clamp(300px, calc(100vh - 22rem), 640px);
+  overflow-y: auto;
   padding: 0.8rem;
   border-radius: var(--radius-md);
   border: 1px solid var(--line-soft);
   background: #fff;
   line-height: 1.75;
   color: #1f2937;
-  overflow: auto;
 }
 
 .md-preview :deep(h1) { font-size: 1.5rem; margin: 0.7rem 0 0.35rem; }
@@ -244,11 +249,15 @@ onMounted(async () => {
 
 textarea {
   width: 100%;
+  /* 高度受视口约束（而非 rows 属性撑开），长文在框内滚动 */
+  height: clamp(300px, calc(100vh - 22rem), 640px);
+  min-height: 300px;
   border: 1px solid #bfd0e5;
   border-radius: var(--radius-md);
   padding: 0.7rem;
   font: 400 0.94rem/1.5 var(--font-mono);
   resize: vertical;
+  box-sizing: border-box;
 }
 
 button {

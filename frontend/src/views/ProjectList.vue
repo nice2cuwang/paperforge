@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 
 import { apiRequest } from "../api";
@@ -149,6 +149,23 @@ function prevStep() {
   if (step.value > 1) step.value--;
 }
 
+/* ── Project card menu ─────────────────────────── */
+const openMenuId = ref<string | null>(null);
+
+function toggleProjectMenu(event: Event, id: string) {
+  event.stopPropagation();
+  openMenuId.value = openMenuId.value === id ? null : id;
+}
+
+function closeProjectMenu() {
+  openMenuId.value = null;
+}
+
+function onMenuDelete(project: Project) {
+  closeProjectMenu();
+  void deleteProject(project);
+}
+
 /* ── Project CRUD ──────────────────────────────── */
 const templateLabelMap = computed(() => {
   const map: Record<string, string> = {};
@@ -215,8 +232,19 @@ function formatProjectType(type: string): string {
   return templateLabelMap.value[type] || type;
 }
 
+function langLabel(code: string): string {
+  return languageOptions.find((l) => l.code === code)?.label ?? code;
+}
+
 /* ── Lifecycle ─────────────────────────────────── */
-onMounted(loadProjects);
+onMounted(() => {
+  loadProjects();
+  document.addEventListener("click", closeProjectMenu);
+});
+
+onUnmounted(() => {
+  document.removeEventListener("click", closeProjectMenu);
+});
 </script>
 
 <template>
@@ -488,29 +516,43 @@ onMounted(loadProjects);
            ═══════════════════════════════════════════ -->
       <section class="list-col">
         <div class="list-header">
-          <h2>已有项目</h2>
+          <h2>已有项目 <span class="list-count">{{ projects.length }}</span></h2>
           <button class="ghost-btn" type="button" @click="loadProjects">刷新</button>
         </div>
 
         <div v-if="loading" class="loading-state">加载中…</div>
         <div v-else-if="projects.length === 0" class="empty-state">
-          <p>还没有项目，在左侧创建一个。</p>
+          <p>还没有项目，先创建一个吧。</p>
         </div>
         <ul v-else class="project-list">
           <li v-for="project in projects" :key="project.id" class="project-card">
             <div class="pc-info">
               <h3>{{ project.title }}</h3>
               <p>{{ project.research_question }}</p>
-              <div class="pc-tags">
-                <span class="tag">{{ formatProjectType(project.article_type) }}</span>
-                <span class="tag">{{ project.language }}</span>
-                <span class="tag">~{{ project.target_words.toLocaleString() }} 字</span>
-              </div>
+              <span class="pc-meta">
+                {{ formatProjectType(project.article_type) }}
+                · {{ langLabel(project.language) }}
+                · ~{{ project.target_words.toLocaleString() }} 字
+              </span>
             </div>
             <div class="pc-actions">
-              <RouterLink :to="`/projects/${project.id}/chat`" class="pc-btn primary">对话</RouterLink>
-              <RouterLink :to="`/projects/${project.id}`" class="pc-btn ghost">总览</RouterLink>
-              <button type="button" class="pc-btn danger" @click="deleteProject(project)">删除</button>
+              <RouterLink :to="`/projects/${project.id}/chat`" class="pc-btn primary">继续写作</RouterLink>
+              <div class="pc-menu-wrap">
+                <button
+                  type="button"
+                  class="pc-kebab"
+                  aria-label="更多操作"
+                  @click="toggleProjectMenu($event, project.id)"
+                >···</button>
+                <div v-if="openMenuId === project.id" class="pc-menu" @click.stop>
+                  <RouterLink :to="`/projects/${project.id}`" class="pc-menu-item" @click="closeProjectMenu">
+                    项目总览
+                  </RouterLink>
+                  <button type="button" class="pc-menu-item danger" @click="onMenuDelete(project)">
+                    删除项目
+                  </button>
+                </div>
+              </div>
             </div>
           </li>
         </ul>
@@ -524,8 +566,7 @@ onMounted(loadProjects);
 <style scoped>
 .board {
   display: grid;
-  gap: 1.2rem;
-  max-width: 1200px;
+  gap: 1.6rem;
 }
 
 .headline h1 {
@@ -546,8 +587,10 @@ onMounted(loadProjects);
 /* ── Main grid ── */
 .main-grid {
   display: grid;
-  grid-template-columns: 1.15fr 0.85fr;
-  gap: 1.2rem;
+  /* minmax(0, fr)：去掉 fr 的 auto 最小宽度，防止项目卡片里的 nowrap 长文本
+     把右列轨道撑爆、挤占左列并向外溢出 */
+  grid-template-columns: minmax(0, 1fr) clamp(300px, 30vw, 400px);
+  gap: 3rem;
   align-items: start;
 }
 
@@ -555,11 +598,6 @@ onMounted(loadProjects);
    WIZARD
    ═══════════════════════════════════════════════════ */
 .wizard-col {
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  padding: 1.3rem;
-  box-shadow: var(--shadow-sm);
   animation: rise-in 300ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
@@ -634,7 +672,7 @@ onMounted(loadProjects);
 
 .step-content h2 {
   margin: 0 0 0.3rem;
-  font-size: 1.1rem;
+  font-size: 1.3rem;
   font-family: var(--font-display);
 }
 
@@ -647,15 +685,16 @@ onMounted(loadProjects);
 /* ── Template cards (Step 1) ── */
 .template-grid {
   display: grid;
-  gap: 0.6rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.9rem;
 }
 
 .tpl-card {
   display: flex;
   align-items: flex-start;
-  gap: 0.75rem;
-  padding: 0.85rem;
-  border: 2px solid var(--line-soft);
+  gap: 0.8rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: var(--surface-strong);
   cursor: pointer;
@@ -673,11 +712,11 @@ onMounted(loadProjects);
 .tpl-card.selected {
   border-color: var(--accent);
   background: var(--accent-light);
-  box-shadow: 0 0 0 3px rgba(13, 124, 117, 0.08);
+  box-shadow: 0 0 0 1px var(--accent);
 }
 
 .tpl-emoji {
-  font-size: 1.6rem;
+  font-size: 1.8rem;
   flex-shrink: 0;
   margin-top: 2px;
 }
@@ -944,7 +983,7 @@ input[type="range"] {
 
 /* ── Summary card ── */
 .summary-card {
-  border: 1px solid var(--accent-muted);
+  border: 0;
   border-radius: var(--radius-md);
   background: linear-gradient(135deg, var(--accent-light) 0%, var(--surface) 100%);
   padding: 0.85rem;
@@ -959,7 +998,7 @@ input[type="range"] {
 
 .summary-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 0.35rem 0.8rem;
 }
 
@@ -979,6 +1018,7 @@ input[type="range"] {
   font-size: 0.84rem;
   color: var(--ink-soft);
   font-weight: 500;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1044,13 +1084,6 @@ input[type="range"] {
    PROJECT LIST
    ═══════════════════════════════════════════════════ */
 .list-col {
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background:
-    radial-gradient(200px 110px at -5% -5%, rgba(245, 225, 185, 0.3) 0%, transparent 70%),
-    var(--surface);
-  padding: 1.1rem;
-  box-shadow: var(--shadow-sm);
   animation: rise-in 300ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
@@ -1058,12 +1091,32 @@ input[type="range"] {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 0.8rem;
+  margin-bottom: 0.5rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--line-soft);
 }
 
 .list-header h2 {
   margin: 0;
-  font-size: 0.95rem;
+  font-size: 0.8rem;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.list-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  margin-left: 0.4rem;
+  border-radius: 99px;
+  background: var(--line-soft);
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  vertical-align: middle;
 }
 
 .ghost-btn {
@@ -1088,23 +1141,25 @@ input[type="range"] {
   padding: 0;
   list-style: none;
   display: grid;
-  gap: 0.6rem;
+  /* minmax(0, 1fr)：卡片内 nowrap 的研究问题文本会抬高 min-content，
+     无此约束时隐式轨道被撑破容器导致横向溢出 */
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.2rem;
 }
 
 .project-card {
-  border: 1px solid var(--line-soft);
   border-radius: var(--radius-md);
-  padding: 0.8rem;
-  background: var(--surface-strong);
+  padding: 0.85rem 0.9rem;
+  background: transparent;
   display: flex;
   justify-content: space-between;
   gap: 0.7rem;
-  align-items: flex-start;
-  transition: border-color 160ms ease, box-shadow 160ms ease;
+  align-items: center;
+  transition: background 160ms ease, box-shadow 160ms ease;
 }
 
 .project-card:hover {
-  border-color: var(--accent-muted);
+  background: var(--surface-strong);
   box-shadow: var(--shadow-sm);
 }
 
@@ -1122,39 +1177,35 @@ input[type="range"] {
 .pc-info p {
   margin: 0.2rem 0;
   color: var(--muted);
-  font-size: 0.82rem;
+  font-size: 0.8rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.pc-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.3rem;
-  margin-top: 0.3rem;
-}
-
-.tag {
-  font-size: 0.7rem;
-  color: var(--muted);
-  background: rgba(21, 29, 46, 0.03);
-  border: 1px solid var(--line-soft);
-  border-radius: 5px;
-  padding: 0.1rem 0.4rem;
+.pc-meta {
+  display: block;
+  margin-top: 0.2rem;
+  font-size: 0.74rem;
+  color: var(--muted-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pc-actions {
-  display: grid;
-  gap: 0.3rem;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
   flex-shrink: 0;
 }
 
 .pc-btn {
   border: 0;
   border-radius: var(--radius-sm);
-  padding: 0.35rem 0.6rem;
-  font-size: 0.8rem;
+  padding: 0.42rem 0.9rem;
+  font-size: 0.82rem;
+  font-weight: 500;
   text-decoration: none;
   text-align: center;
   cursor: pointer;
@@ -1170,24 +1221,70 @@ input[type="range"] {
   background: var(--accent-strong);
 }
 
-.pc-btn.ghost {
-  background: var(--surface-strong);
-  color: var(--muted);
-  border: 1px solid var(--line-soft);
+/* ── Kebab menu ── */
+.pc-menu-wrap {
+  position: relative;
 }
 
-.pc-btn.ghost:hover {
-  border-color: var(--accent-muted);
-  color: var(--ink-soft);
-}
-
-.pc-btn.danger {
+.pc-kebab {
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--danger);
-  border: 1px solid transparent;
+  color: var(--muted-soft);
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  transition: all 150ms ease;
 }
 
-.pc-btn.danger:hover {
+.pc-kebab:hover {
+  background: var(--line-soft);
+  color: var(--ink);
+}
+
+.pc-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 60;
+  min-width: 128px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-strong);
+  box-shadow: var(--shadow-md);
+  display: grid;
+}
+
+.pc-menu-item {
+  border: 0;
+  border-radius: 7px;
+  padding: 0.45rem 0.7rem;
+  background: transparent;
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 0.84rem;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.pc-menu-item:hover {
+  background: var(--line-soft);
+}
+
+.pc-menu-item.danger {
+  color: var(--danger);
+}
+
+.pc-menu-item.danger:hover {
   background: var(--danger-light);
 }
 
@@ -1205,15 +1302,17 @@ input[type="range"] {
   animation: rise-in 200ms ease;
 }
 
-@media (max-width: 1050px) {
+@media (max-width: 1150px) {
   .main-grid {
     grid-template-columns: 1fr;
+    gap: 2rem;
   }
 }
 
 @media (max-width: 640px) {
   .template-grid {
-    gap: 0.5rem;
+    grid-template-columns: 1fr;
+    gap: 0.6rem;
   }
 
   .tone-row {
@@ -1226,14 +1325,6 @@ input[type="range"] {
 
   .summary-grid {
     grid-template-columns: 1fr;
-  }
-
-  .project-card {
-    flex-direction: column;
-  }
-
-  .pc-actions {
-    flex-direction: row;
   }
 
   .step-label {
