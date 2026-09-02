@@ -243,22 +243,30 @@ def search_node(state: WorkflowState) -> dict[str, Any]:
 
     add_log(task_id, f"searching: query={query[:80]}")
 
-    # ── Clean up papers from previous runs to prevent accumulation ──
-    old_paper_count = db.scalar(
-        select(func.count(Paper.id)).where(Paper.project_id == state["project_id"])
-    ) or 0
-    if old_paper_count > 0:
-        # Cascade: delete chunks, then papers (evidence/issues are cleaned by their own nodes)
-        db.execute(
-            delete(PaperChunk).where(
-                PaperChunk.paper_id.in_(
-                    select(Paper.id).where(Paper.project_id == state["project_id"])
-                )
-            )
-        )
-        db.execute(delete(Paper).where(Paper.project_id == state["project_id"]))
+    # ── Clean up stale auto-search rows from previous runs ──────
+    # 用户资产会被保留：手工录入 / 本地上传（含本地 PDF）的论文行跨 run 留存，
+    # ingest 直接复用本地 PDF，旧行由 run_search_and_select 负责重新遴选
+    # （重新打分、deselect）。只有从未产生 PDF 的自动检索行才是上一次运行的
+    # 临时产物，需要清理以免无限累积。
+    def _is_user_asset(paper: Paper) -> bool:
+        source = (paper.source or "").strip().lower()
+        if not source or source in ("upload", "manual", "fallback"):
+            return True
+        return bool((paper.local_pdf_path or "").strip())
+
+    old_papers = list(db.scalars(select(Paper).where(Paper.project_id == state["project_id"])).all())
+    stale_papers = [p for p in old_papers if not _is_user_asset(p)]
+    if stale_papers:
+        # Cascade: delete chunks, then stale paper rows (evidence/issues are cleaned by their own nodes)
+        db.execute(delete(PaperChunk).where(PaperChunk.paper_id.in_([p.id for p in stale_papers])))
+        for p in stale_papers:
+            db.delete(p)
         db.flush()
-        add_log(task_id, f"cleaned up {old_paper_count} papers from previous run")
+        add_log(
+            task_id,
+            f"cleaned {len(stale_papers)}/{len(old_papers)} stale auto-search papers "
+            f"(kept {len(old_papers) - len(stale_papers)} user/local-PDF rows)",
+        )
 
     selected_papers, inserted, reselection_triggered, rewritten_queries, required_terms = run_search_and_select(
         project_id=state["project_id"],
@@ -778,6 +786,46 @@ def community_sources_node(state: WorkflowState) -> dict[str, Any]:
     cards = list(db.scalars(
         select(EvidenceCard).where(EvidenceCard.project_id == state["project_id"])
     ).all())
+
+    # ── 全来源证据为空 → 显式失败（恢复错误契约）─────────────────
+    # 学术 + web + 社区/LLM 三路证据全部为 0 才是真正的“无据可写”；
+    # 任一来源有证据都继续成文（web-only 文章是受支持的产品形态），
+    # 只有全空时按 NO_EVIDENCE_CARDS 返回 400，摘要与旧 runner 对齐。
+    if not cards:
+        add_log(task_id, "FATAL: no evidence cards from any source (academic/web/community)")
+        skipped_titles = [
+            d["title"] for d in state.get("paper_diagnostics", []) if d.get("status") == "skipped_no_pdf"
+        ][:6]
+        failed_items = [
+            {"title": d.get("title"), "error": d.get("error")}
+            for d in state.get("paper_diagnostics", []) if d.get("status") == "failed"
+        ][:6]
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "NO_EVIDENCE_CARDS",
+                "title": "No evidence cards were generated",
+                "message": "No evidence could be built from academic papers, web or community sources.",
+                "summary": {
+                    "selected_count": len(state.get("selected_papers", [])),
+                    "reused_local_pdf_count": state.get("reused_local_pdf_count", 0),
+                    "downloaded_count": state.get("downloaded_count", 0),
+                    "parsed_count": state.get("parsed_count", 0),
+                    "skipped_no_pdf_count": state.get("skipped_no_pdf_count", 0),
+                    "failed_count": state.get("failed_count", 0),
+                    "evidence_count": 0,
+                    "metadata_fallback_evidence_count": state.get("metadata_fallback_evidence_count", 0),
+                    "low_relevance_filtered_count": state.get("low_relevance_filtered_count", 0),
+                    "web_evidence_count": 0,
+                    "community_evidence_count": 0,
+                    "llm_knowledge_count": 0,
+                },
+                "skipped_titles": skipped_titles,
+                "failed_items": failed_items,
+                "paper_diagnostics": state.get("paper_diagnostics", [])[:20],
+                "next_actions": ["Upload a local PDF or refine the search query."],
+            },
+        )
 
     return {
         "community_evidence_count": community_count,
