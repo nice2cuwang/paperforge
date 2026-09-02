@@ -52,6 +52,16 @@ class StorageBackend(ABC):
         """Ensure the export directory exists. Returns its path/URI prefix."""
 
 
+def _escape_xml_entities(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
 # ── Local filesystem backend ─────────────────────────────────────
 
 
@@ -75,16 +85,13 @@ class LocalStorage(StorageBackend):
         target_dir = self.base_dir / "storage" / project_id / "tei"
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / f"{paper_id}.tei.xml"
-        escaped = (
-            text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-            .replace("'", "&apos;")
-        )
         target.write_text(
             "<TEI><text><body>"
-            + "".join(f"<p>{escaped}</p>" for line in text.splitlines() if line.strip())
+            + "".join(
+                f"<p>{_escape_xml_entities(line)}</p>"
+                for line in text.splitlines()
+                if line.strip()
+            )
             + "</body></text></TEI>",
             encoding="utf-8",
         )
