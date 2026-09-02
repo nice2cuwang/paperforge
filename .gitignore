@@ -48,3 +48,14 @@ nul
 htmlcov/
 .coverage
 coverage.xml
+
+# 本地工具残留 / 临时产物
+.claude/
+.codely/
+.codely-cli/
+CODELY.md
+pf_run.tmp.json
+pf_task.tmp.json
+latest_article_v2.md
+*qoderwork*
+backend/test_ddg.py
