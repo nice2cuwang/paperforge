@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 from fastapi import HTTPException, status
@@ -42,29 +42,49 @@ logger = logging.getLogger(__name__)
 
 
 def _execute_auto_workflow(
-    project_id: str, payload: RunAutoWorkflowRequest, db: Session, task_id: str
+    project_id: str,
+    payload: RunAutoWorkflowRequest,
+    db: Session,
+    task_id: str,
+    component_overrides: Mapping[str, Callable] | None = None,
 ) -> dict:
     """Execute the full auto-workflow.
 
     When langgraph is installed, uses the StateGraph-based implementation
     (graph.py). Falls back to the inline implementation otherwise.
+
+    ``component_overrides`` (C seams, see docs/architecture/component-seams.md)
+    carries per-run replacements for the five documented service entry
+    points; they ride on the initial state so the compiled graph singleton
+    stays reusable and concurrent-safe. API routes do not expose it yet --
+    this is the test / secondary-development entry.
     """
     # 任务上下文：让本次运行中所有 LLM 调用的审计日志归属到 task/project，
     # 供 token 消耗统计聚合。
     from app.services.llm_service import task_context
 
     with task_context(task_id, project_id):
-        return _execute_auto_workflow_inner(project_id, payload, db, task_id)
+        return _execute_auto_workflow_inner(
+            project_id, payload, db, task_id, component_overrides=component_overrides,
+        )
 
 
 def _execute_auto_workflow_inner(
-    project_id: str, payload: RunAutoWorkflowRequest, db: Session, task_id: str
+    project_id: str,
+    payload: RunAutoWorkflowRequest,
+    db: Session,
+    task_id: str,
+    component_overrides: Mapping[str, Callable] | None = None,
 ) -> dict:
     try:
         from app.services.workflow.graph import _build_initial_state, _workflow_graph
         add_log(task_id, "enter _execute_auto_workflow (langgraph)")
         initial_state = _build_initial_state(
-            project_id=project_id, payload=payload, db=db, task_id=task_id,
+            project_id=project_id,
+            payload=payload,
+            db=db,
+            task_id=task_id,
+            component_overrides=component_overrides,
         )
         final_state = _workflow_graph.invoke(initial_state)
         return final_state["result"]

@@ -11,7 +11,7 @@ import re
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, Callable, Literal, Mapping, TypedDict
 from uuid import uuid4
 
 from fastapi import HTTPException, status
@@ -129,6 +129,13 @@ class WorkflowState(TypedDict, total=False):
     gap_added_count: int
     low_evidence_sections: list[str]
 
+    # Component seams (C): per-run overrides for the five documented
+    # replacement points (recall_chunks / plan_sections / build_draft /
+    # review / generate_image). Carried on the state so the compiled graph
+    # singleton stays reusable and concurrent-safe -- module-level node
+    # functions cannot capture overrides in a build-time closure.
+    component_overrides: dict[str, Callable] | None
+
     # Conflict detection (S4)
     conflict_groups: list[dict[str, Any]]
 
@@ -177,7 +184,11 @@ class WorkflowState(TypedDict, total=False):
 
 
 def _build_initial_state(
-    project_id: str, payload: RunAutoWorkflowRequest, db: Session, task_id: str
+    project_id: str,
+    payload: RunAutoWorkflowRequest,
+    db: Session,
+    task_id: str,
+    component_overrides: Mapping[str, Callable] | None = None,
 ) -> WorkflowState:
     return WorkflowState(
         project_id=project_id,
@@ -185,6 +196,7 @@ def _build_initial_state(
         db=db,
         task_id=task_id,
         query="",
+        component_overrides=dict(component_overrides) if component_overrides else None,
         selected_papers=[],
         inserted=0,
         auto_selected_count=0,
@@ -230,6 +242,23 @@ def _build_initial_state(
         generated_images=[],
         extracted_figures=[],
     )
+
+
+# ── C: 组件替换点（component seams）────────────────────────────────
+# 五个文档化的轻替换点（见 docs/architecture/component-seams.md）在节点
+# 调用处走单一间接层 _seam()：测试与二次开发经 initial_state 的
+# component_overrides 注入自定义实现（键=环节名），不传时行为与直接调用
+# 默认服务函数完全一致。runner 层透传见 runner._execute_auto_workflow。
+
+def _seam(state: Mapping[str, Any], key: str, fallback: Callable) -> Callable:
+    """Resolve the component override for ``key``, or fall back to the default.
+
+    The override key maps to one documented service function; the caller then
+    invokes the returned callable with the *same arguments* it would have
+    passed to the default (see component-seams.md per-seam signatures).
+    """
+    overrides = state.get("component_overrides") or {}
+    return overrides.get(key) or fallback
 
 
 # ── Node 1: search_and_select ────────────────────────────────────
@@ -494,6 +523,10 @@ def evidence_node(state: WorkflowState) -> dict[str, Any]:
     try:
         from app.services.retrieval_service import recall_chunks
 
+        # Component seam "recall_chunks": (query, project_id, top_k) ->
+        # list[dict] of chunk hits ranked best-first. Shadows the late import
+        # so the override key is resolved per run from the initial state.
+        recall_chunks = _seam(state, "recall_chunks", recall_chunks)
         for rank, hit in enumerate(recall_chunks(query, project_id=state["project_id"], top_k=120)):
             cid = str(hit.get("id") or "")
             if not cid:
@@ -1152,7 +1185,11 @@ def draft_node(state: WorkflowState) -> dict[str, Any]:
     cards = state["cards"]
 
     set_progress(task_id, 78, "generating draft")
-    content_md, draft_sections = build_draft_markdown(
+    # Component seam "build_draft": (project_title, research_question,
+    # article_type, citation_style, evidence_cards, thesis_statement,
+    # sections, figure_plans, conflict_groups, papers_off_topic,
+    # low_evidence_sections) -> (content_md, sections).
+    content_md, draft_sections = _seam(state, "build_draft", build_draft_markdown)(
         project_title=payload.draft_title or project.title,
         research_question=project.research_question,
         article_type=project.article_type,
@@ -1210,7 +1247,9 @@ def thesis_thread_node(state: WorkflowState) -> dict[str, Any]:
     )
     # Section headings are also planned at outline stage (before drafting) so
     # plan_figures (F1) and the writing prompt share one section list.
-    sections = plan_article_sections(
+    # Component seam "plan_sections": (article_type, project_title,
+    # research_question, evidence_cards) -> list[str].
+    sections = _seam(state, "plan_sections", plan_article_sections)(
         article_type=project.article_type,
         project_title=payload.draft_title or project.title,
         research_question=project.research_question,
@@ -1364,6 +1403,9 @@ def evidence_gap_node(state: WorkflowState) -> dict[str, Any]:
             try:
                 from app.services.retrieval_service import recall_chunks
 
+                # Component seam "recall_chunks"（与 evidence_node 同键，见
+                # docs/architecture/component-seams.md）
+                recall_chunks = _seam(state, "recall_chunks", recall_chunks)
                 recall_ids = [
                     str(hit.get("id"))
                     for hit in recall_chunks(qtext, project_id=project_id, top_k=60)
@@ -1607,8 +1649,10 @@ def image_generation_node(state: WorkflowState) -> dict[str, Any]:
 
     # ── 2. Data-driven charts from evidence cards ──────────────────
     try:
+        # Component seam "generate_image"（数据图表子环节，签名见
+        # docs/architecture/component-seams.md；抽取图/SVG 卡/装饰不在此缝内）
         chart_dir = backend_dir / "data" / "storage" / state["project_id"] / "images" / "charts"
-        chart_images = generate_charts_from_evidence(
+        chart_images = _seam(state, "generate_image", generate_charts_from_evidence)(
             cards=cards,
             project_id=state["project_id"],
             project_title=project.title or "",
@@ -1841,7 +1885,10 @@ def initial_review_node(state: WorkflowState) -> dict[str, Any]:
         card_dict["conflict_group"] = group_by_card_id.get(str(c.id), "")
         review_cards.append(card_dict)
 
-    review_payloads, review_metrics = debate_review_with_metrics(
+    # Component seam "review": (content_md, evidence_cards, article_type,
+    # task_id, ...) -> (issues, metrics), shared by initial_review and the
+    # revision-loop review (see docs/architecture/component-seams.md).
+    review_payloads, review_metrics = _seam(state, "review", debate_review_with_metrics)(
         draft.content_md,
         evidence_cards=review_cards,
         article_type=project.article_type,
@@ -1960,7 +2007,8 @@ def review_node(state: WorkflowState) -> dict[str, Any]:
     set_progress(task_id, min(96, 90 + (state["revision_round"] + 1) * 2),
                  f"reviewing revision round {state['revision_round'] + 1} (multi-agent debate)")
 
-    revised_issues, revised_metrics = debate_review_with_metrics(
+    # Component seam "review"（与 initial_review_node 同键同签名）
+    revised_issues, revised_metrics = _seam(state, "review", debate_review_with_metrics)(
         state["current_content"],
         evidence_cards=[_evidence_to_dict(c) for c in cards],
         article_type=project.article_type,
